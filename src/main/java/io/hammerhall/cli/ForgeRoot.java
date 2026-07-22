@@ -34,7 +34,7 @@ public final class ForgeRoot {
         }
         throw new CliException("""
                 Это не похоже на кузницу: не найден pom.xml рядом с src/main/java.
-                Запусти команду внутри клонированного репозитория кузницы.""");
+                Запустите команду внутри клонированного репозитория кузницы.""");
     }
 
     private static boolean looksLikeForge(Path dir) {

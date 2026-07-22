@@ -48,7 +48,7 @@ public class SubmitCommand {
     public int run(String[] args) throws IOException {
         if (args.length == 0) {
             throw new CliException("""
-                    Укажи файл:
+                    Укажите файл:
                         hammerhall submit MovCode0002.java""");
         }
 
@@ -176,7 +176,7 @@ public class SubmitCommand {
             // пакетах — это разные задачи, и угадывание отправило бы не ту.
             StringBuilder message = new StringBuilder("Файлов с таким именем несколько:\n");
             found.forEach(path -> message.append("    ").append(root.relativize(path)).append('\n'));
-            message.append("Укажи путь целиком.");
+            message.append("Укажите путь целиком.");
             throw new CliException(message.toString());
         }
         return found.getFirst();

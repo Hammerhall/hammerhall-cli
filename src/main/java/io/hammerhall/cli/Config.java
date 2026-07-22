@@ -82,7 +82,7 @@ public class Config {
         String token = values.get(KEY_TOKEN);
         if (token == null || token.isBlank()) {
             throw new CliException("""
-                    Токен не сохранён. Выполни:
+                    Токен не сохранён. Выполните:
                         hammerhall login""");
         }
         return token;
@@ -164,7 +164,7 @@ public class Config {
             if (code == 1) {
                 console.warn("""
                         Файл .hammerhall/config НЕ игнорируется git.
-                        Токен может уехать в публичный форк. Добавь в .gitignore:
+                        Токен может уехать в публичный форк. Добавьте в .gitignore:
                             .hammerhall/""");
             }
         } catch (IOException | InterruptedException ignored) {

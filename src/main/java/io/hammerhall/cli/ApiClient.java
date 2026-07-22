@@ -85,7 +85,7 @@ public class ApiClient {
         throw new CliException(switch (status) {
             case 401 -> """
                     Токен не принят. Возможно, он устарел или скопирован не полностью.
-                    Перевыпусти в личном кабинете и выполни: hammerhall login""";
+                    Перевыпустите в личном кабинете и выполните: hammerhall login""";
             case 403 -> "Доступ закрыт: " + message(response.body());
             case 404 -> "Не найдено: " + message(response.body());
             case 413 -> "Файл слишком большой для проверки";
@@ -102,9 +102,9 @@ public class ApiClient {
     private String tooManyRequests(HttpResponse<String> response) {
         String retryAfter = response.headers().firstValue("Retry-After").orElse(null);
         if (retryAfter != null) {
-            return "Слишком часто. Повтори через " + retryAfter + " с.";
+            return "Слишком часто. Повторите через " + retryAfter + " с.";
         }
-        return "Слишком часто. Подожди немного.";
+        return "Слишком часто. Подождите немного.";
     }
 
     /**
