@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.hammerhall</groupId>
+    <artifactId>hammerhall-cli</artifactId>
+    <version>0.1.0</version>
+    <packaging>jar</packaging>
+
+    <name>Hammerhall CLI</name>
+    <description>Клиент кузницы: отправка решений и профиль</description>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <!--
+        ЗАВИСИМОСТЕЙ НЕТ, и это требование, а не совпадение.
+
+        Клиент качается обёрткой при первом запуске в кузнице пользователя.
+        Каждая библиотека — это мегабайты в загрузке и ещё одна вещь,
+        которую надо обновлять при уязвимостях. HTTP берём из JDK
+        (java.net.http), JSON читаем сами: разбираем ответы, которые
+        сами же и формируем на сервере.
+
+        Java 25 — та же, что в кузнице и на платформе. Занижать планку
+        не от чего: пользователь клонирует кузницу, которая собирается
+        на 25, значит эта JDK у него уже стоит. Единая версия во всех трёх
+        репозиториях избавляет от вопросов совместимости заранее.
+    -->
+
+    <build>
+        <finalName>cli-${project.version}</finalName>
+        <plugins>
+            <!--
+                Версия закреплена сознательно: дефолтная из super-POM зависит
+                от версии Maven, и старые (3.1 и раньше) не понимают
+                maven.compiler.release — молча берут source 5 и падают.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>io.hammerhall.cli.Main</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
