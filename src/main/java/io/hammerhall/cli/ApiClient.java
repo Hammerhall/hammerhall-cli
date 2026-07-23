@@ -21,13 +21,25 @@ import java.time.Duration;
  *
  * <h3>Таймаут</h3>
  *
- * Минута на ответ. Кажется много, но проверка решения — это ЗАПУСК
+ * Две минуты на ответ. Кажется много, но проверка решения — это ЗАПУСК
  * контейнера: компиляция, байткод-скан, прогон закрытых тестов. Боевой
- * замер — 1007 мс, однако при холодном старте или очереди раннеров бывает
- * дольше. Оборвать на десятой секунде значит показать ошибку там, где
- * проверка на самом деле шла нормально.
+ * замер — 1007 мс, однако между запросом и контейнером стоит ОЧЕРЕДЬ:
+ * платформа держит пул раннеров (бюджет памяти хоста), и под нагрузкой
+ * решение ждёт своей очереди.
+ *
+ * <p>⚠️ Число связано с сервером: предел ЗДЕСЬ обязан быть больше
+ * {@code submission.await-timeout-seconds} платформы (90 с). Иначе клиент
+ * сдаётся раньше, чем платформа заканчивает проверку: человек видит «сбой
+ * связи», хотя решение считается нормально, и отправляет повторно — а там
+ * уже идемпотентность. Меняете предел на сервере — правьте и здесь.
  */
 public class ApiClient {
+
+    /**
+     * Предел ожидания ответа. ОБЯЗАН быть больше серверного
+     * {@code submission.await-timeout-seconds} (90 с) — см. javadoc класса.
+     */
+    private static final Duration RESPONSE_TIMEOUT = Duration.ofMinutes(2);
 
     private final String baseUrl;
     private final String token;
@@ -56,7 +68,7 @@ public class ApiClient {
         HttpRequest request = builder
                 .header("Authorization", "Bearer " + token)
                 .header("Accept", "application/json")
-                .timeout(Duration.ofMinutes(1))
+                .timeout(RESPONSE_TIMEOUT)
                 .build();
 
         HttpResponse<String> response;
@@ -90,7 +102,7 @@ public class ApiClient {
             case 404 -> "Не найдено: " + message(response.body());
             case 413 -> "Файл слишком большой для проверки";
             case 429 -> tooManyRequests(response);
-            case 503 -> "Платформа временно недоступна, попробуй через минуту";
+            case 503 -> temporarilyBusy(response);
             default -> "Платформа ответила " + status + ": " + message(response.body());
         });
     }
@@ -100,11 +112,35 @@ public class ApiClient {
      * чтобы сказать человеку, сколько ждать, вместо расплывчатого «слишком часто».
      */
     private String tooManyRequests(HttpResponse<String> response) {
-        String retryAfter = response.headers().firstValue("Retry-After").orElse(null);
+        String retryAfter = retryAfter(response);
         if (retryAfter != null) {
             return "Слишком часто. Повторите через " + retryAfter + " с.";
         }
         return "Слишком часто. Подождите немного.";
+    }
+
+    /**
+     * Платформа занята: пул проверок переполнен.
+     * <p>
+     * Это <b>не поломка</b>. Решение не потеряно и не проверено — его надо
+     * просто отправить снова. Сервер сам говорит, через сколько, и своё число
+     * мы не выдумываем: поменяется политика пула — фраза поедет за ней.
+     */
+    private String temporarilyBusy(HttpResponse<String> response) {
+        String retryAfter = retryAfter(response);
+        if (retryAfter != null) {
+            return "Платформа занята проверками. Повторите через " + retryAfter + " с.";
+        }
+        return "Платформа временно недоступна. Повторите чуть позже.";
+    }
+
+    /**
+     * Через сколько повторять, если сервер сказал. Общий разбор для 429 и 503:
+     * оба ответа несут {@code Retry-After} и оба означают «сейчас нельзя, позже
+     * можно» — разница только в причине отказа.
+     */
+    private String retryAfter(HttpResponse<String> response) {
+        return response.headers().firstValue("Retry-After").orElse(null);
     }
 
     /**
