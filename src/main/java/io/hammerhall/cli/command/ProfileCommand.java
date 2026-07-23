@@ -47,14 +47,19 @@ public class ProfileCommand {
         Config config = Config.load(root);
         ApiClient api = new ApiClient(config.api(), config.token());
 
-        String forgeId = args.length > 0 ? args[0] : forgeIdOf(root);
+        String forgeId = args.length > 0 ? args[0] : ForgeRoot.forgeId(root);
         String response = api.get("/profile/" + forgeId);
 
         print(forgeId, response);
         return 0;
     }
 
-    private void print(String forgeId, String response) {
+    /**
+     * Отрисовка ответа платформы. Пакетная видимость — ради теста: здесь
+     * живёт весь разбор JSON и всё форматирование, то есть ровно то, что
+     * ломается молча при смене формы ответа.
+     */
+    void print(String forgeId, String response) {
         long solved = Json.number(response, "tasksSolved", 0);
         long points = Json.number(response, "totalPoints", 0);
 
@@ -194,7 +199,4 @@ public class ProfileCommand {
         }
     }
 
-    private String forgeIdOf(Path root) {
-        return root.getFileName().toString();
-    }
 }

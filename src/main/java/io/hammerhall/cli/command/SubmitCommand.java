@@ -70,8 +70,15 @@ public class SubmitCommand {
         return report(response);
     }
 
-    /** Печатает вердикт. Возвращает код выхода: 0 — прошло, 1 — нет. */
-    private int report(String response) {
+    /**
+     * Печатает вердикт. Возвращает код выхода: 0 — прошло, 1 — нет.
+     * <p>
+     * Пакетная видимость — ради теста. Здесь разбирается ответ платформы,
+     * включая вырезание вложенного объекта {@code tests} строковым поиском:
+     * поменяется форма ответа — человек увидит «0/0 тестов» вместо вердикта
+     * и решит, что виновата платформа. Такое обязано быть под тестом.
+     */
+    int report(String response) {
         String status = Json.string(response, "status");
         long duration = Json.number(response, "durationMs", 0);
         boolean fromHistory = Json.bool(response, "fromHistory", false);

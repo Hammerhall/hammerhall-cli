@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.regex.Pattern;
 
 /**
  * Сохранить токен доступа.
@@ -34,6 +35,9 @@ import java.nio.file.Path;
  */
 public class LoginCommand {
 
+    /** Печатаемый ASCII без пробелов — всё, что допустимо в значении заголовка. */
+    private static final Pattern PRINTABLE_ASCII = Pattern.compile("[\\x21-\\x7E]+");
+
     private final Console console;
 
     public LoginCommand(Console console) {
@@ -44,14 +48,7 @@ public class LoginCommand {
         Path root = ForgeRoot.find();
         Config config = Config.load(root);
 
-        String token = args.length > 0 ? args[0] : ask();
-        if (token.isBlank()) {
-            throw new CliException("Пустой токен");
-        }
-
-        // Пробелы по краям — частый результат копирования из браузера.
-        // Молча обрезаем: человек не виноват, что выделилось с запасом.
-        token = token.trim();
+        String token = normalize(args.length > 0 ? args[0] : ask());
 
         verify(config.api(), token);
 
@@ -61,6 +58,36 @@ public class LoginCommand {
         console.success("Токен принят и сохранён");
         console.dim("  " + root.resolve(".hammerhall/config"));
         return 0;
+    }
+
+    /**
+     * Привести введённое к виду, пригодному для отправки.
+     *
+     * <p>Пробелы по краям обрезаются молча: это частый результат копирования
+     * из браузера, и человек не виноват, что выделилось с запасом.
+     *
+     * <p>⚠️ Проверка на ASCII — не придирчивость. Токен уезжает в заголовок
+     * {@code Authorization}, а значения HTTP-заголовков обязаны быть ASCII:
+     * на кириллице {@code HttpClient} бросает {@code IllegalArgumentException},
+     * и человек вместо внятного «токен выглядит неправильно» получает
+     * стектрейс как при поломке платформы. Скопировали не то — надо сказать
+     * об этом словами.
+     */
+    static String normalize(String raw) {
+        if (raw == null) {
+            throw new CliException("Пустой токен");
+        }
+        String token = raw.trim();
+        if (token.isBlank()) {
+            throw new CliException("Пустой токен");
+        }
+        if (!PRINTABLE_ASCII.matcher(token).matches()) {
+            throw new CliException("""
+                    Токен выглядит неправильно: в нём есть символы, которых в токене не бывает.
+                    Токен платформы — строка из латинских букв и цифр.
+                    Скорее всего скопировалось лишнее — попробуйте ещё раз.""");
+        }
+        return token;
     }
 
     /**
