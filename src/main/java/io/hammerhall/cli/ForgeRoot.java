@@ -1,5 +1,7 @@
 package io.hammerhall.cli;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -40,5 +42,31 @@ public final class ForgeRoot {
     private static boolean looksLikeForge(Path dir) {
         return Files.isRegularFile(dir.resolve("pom.xml"))
                 && Files.isDirectory(dir.resolve("src/main/java"));
+    }
+
+    /**
+     * Какой кузнице принадлежит репозиторий.
+     * <p>
+     * Берём из {@code .hammerhall/forge}, а если файла нет — из имени
+     * каталога. Имя каталога человек может переименовать при клонировании,
+     * поэтому это запасной путь, а не основной.
+     * <p>
+     * Живёт здесь, а не в команде: id кузницы нужен и при отправке решения,
+     * и при получении задачи. Две копии одного правила разошлись бы при
+     * первой же правке.
+     */
+    public static String forgeId(Path root) {
+        Path marker = root.resolve(".hammerhall/forge");
+        if (Files.isRegularFile(marker)) {
+            try {
+                String value = Files.readString(marker, StandardCharsets.UTF_8).trim();
+                if (!value.isBlank()) {
+                    return value;
+                }
+            } catch (IOException ignored) {
+                // читаем запасной путь ниже
+            }
+        }
+        return root.getFileName().toString();
     }
 }

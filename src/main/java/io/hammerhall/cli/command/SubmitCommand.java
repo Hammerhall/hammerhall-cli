@@ -58,7 +58,7 @@ public class SubmitCommand {
         Path file = locate(root, args[0]);
         String taskId = taskIdOf(file);
         String code = read(file);
-        String forgeId = forgeIdOf(root);
+        String forgeId = ForgeRoot.forgeId(root);
 
         console.dim("Отправляю " + taskId + "…");
 
@@ -197,28 +197,6 @@ public class SubmitCommand {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
-    }
-
-    /**
-     * Какой кузнице принадлежит репозиторий.
-     * <p>
-     * Берём из {@code .hammerhall/forge}, а если файла нет — из имени
-     * каталога. Имя каталога человек может переименовать при клонировании,
-     * поэтому это запасной путь, а не основной.
-     */
-    private String forgeIdOf(Path root) {
-        Path marker = root.resolve(".hammerhall/forge");
-        if (Files.isRegularFile(marker)) {
-            try {
-                String value = Files.readString(marker, StandardCharsets.UTF_8).trim();
-                if (!value.isBlank()) {
-                    return value;
-                }
-            } catch (IOException ignored) {
-                // читаем запасной путь ниже
-            }
-        }
-        return root.getFileName().toString();
     }
 
     private static String between(String text, String from, String to) {

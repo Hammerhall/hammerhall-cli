@@ -2,6 +2,7 @@ package io.hammerhall.cli;
 
 import io.hammerhall.cli.command.LoginCommand;
 import io.hammerhall.cli.command.ProfileCommand;
+import io.hammerhall.cli.command.PullCommand;
 import io.hammerhall.cli.command.SubmitCommand;
 
 import java.io.PrintStream;
@@ -33,6 +34,7 @@ public final class Main {
             Hammerhall — клиент кузницы
 
               hammerhall login              сохранить токен доступа
+              hammerhall pull <задача>      забрать задачу в свой проект
               hammerhall submit <файл>      отправить решение на проверку
               hammerhall profile [кузница]  показать профиль
 
@@ -81,6 +83,7 @@ public final class Main {
 
         return switch (command) {
             case "login" -> new LoginCommand(console).run(rest);
+            case "pull" -> new PullCommand(console).run(rest);
             case "submit" -> new SubmitCommand(console).run(rest);
             case "profile" -> new ProfileCommand(console).run(rest);
             case "help", "--help", "-h" -> {

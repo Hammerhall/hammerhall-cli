@@ -15,9 +15,14 @@
 
 ```bash
 ./hammerhall login                    # вставить токен (спросит, ввод скрыт)
+./hammerhall pull MovCode0002         # забрать задачу в свой проект
 ./hammerhall submit MovCode0002.java  # отправить решение
 ./hammerhall profile                  # посмотреть профиль
 ```
+
+`pull` кладёт файл в пакет, объявленный в самом тексте задачи, и **не
+затирает** уже существующий файл: если вы решали эту задачу, решение
+останется на месте. Перезаписать — `hammerhall pull MovCode0002 --force`.
 
 Windows — то же самое через `hammerhall.bat`.
 
