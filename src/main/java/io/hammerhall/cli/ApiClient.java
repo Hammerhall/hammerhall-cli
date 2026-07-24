@@ -99,12 +99,35 @@ public class ApiClient {
                     Токен не принят. Возможно, он устарел или скопирован не полностью.
                     Перевыпустите в личном кабинете и выполните: hammerhall login""";
             case 403 -> "Доступ закрыт: " + message(response.body());
-            case 404 -> "Не найдено: " + message(response.body());
+            case 404 -> notFound(response);
             case 413 -> "Файл слишком большой для проверки";
             case 429 -> tooManyRequests(response);
             case 503 -> temporarilyBusy(response);
             default -> "Платформа ответила " + status + ": " + message(response.body());
         });
+    }
+
+    /**
+     * Не найдено — и надо объяснить, что именно.
+     * <p>
+     * Платформа на 404 <b>намеренно молчит</b>: подробность подтверждала бы
+     * существование задачи тому, кому её видеть не положено, а для перебора
+     * идентификаторов это подсказка. Логика правильная, но человек в ответ
+     * получал голое «Не найдено: (без объяснения)» и не мог понять, что не
+     * так: нет задачи, нет доступа или он вообще не в той кузнице.
+     * <p>
+     * Показываем сам запрос. Секрета в нём нет — человек только что сам его
+     * и составил, — зато сразу видно, куда клиент ходил. Ровно так нашлась
+     * первая же ошибка сквозного прогона: в {@code .hammerhall/forge} лежал
+     * {@code project-stream-forge}, а кузница называлась {@code stream-forge}.
+     */
+    private String notFound(HttpResponse<String> response) {
+        String explained = message(response.body());
+        if ("(без объяснения)".equals(explained)) {
+            return "Не найдено: " + response.uri().getPath()
+                    + "\nПроверьте, та ли кузница в .hammerhall/forge и есть ли доступ к задаче.";
+        }
+        return "Не найдено: " + explained;
     }
 
     /**

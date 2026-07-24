@@ -115,6 +115,22 @@ class ApiClientTest {
     }
 
     @Test
+    @DisplayName("🔴 404 с пустым телом — показываем ЧТО спрашивали, а не «(без объяснения)»")
+    void explainsEmptyNotFound() throws IOException {
+        // Платформа на 404 намеренно молчит: подробность подтверждала бы
+        // существование задачи тому, кому её видеть не положено. Но голое
+        // «не найдено» не даёт ни одной зацепки. Так в сквозном прогоне
+        // 24.07 десять минут искали расхождение имени кузницы.
+        ApiClient client = clientFor(404, "");
+
+        assertThatThrownBy(() -> client.get("/tasks/project-stream-forge/MovCode0001"))
+                .isInstanceOf(CliException.class)
+                .hasMessageContaining("/tasks/project-stream-forge/MovCode0001")
+                .hasMessageContaining(".hammerhall/forge")
+                .hasMessageNotContaining("без объяснения");
+    }
+
+    @Test
     @DisplayName("429 — срок повтора берётся у сервера")
     void readsRetryAfterOnRateLimit() throws IOException {
         ApiClient client = clientFor(429, "{}", Map.of("Retry-After", "30"));
