@@ -38,11 +38,26 @@ class ProfileCommandTest {
                 .replaceAll("\u001B\\[[0-9;]*m", "");
     }
 
+    /**
+     * ⚠️ Фикстура списана с РЕАЛЬНОГО ответа платформы
+     * ({@code ProfileController.ProfileResponse}), а не придумана из кода
+     * клиента.
+     * <p>
+     * В первой версии этого теста поля назывались {@code tasksSolved} и
+     * {@code totalPoints} — так их читал клиент. Тест был зелёный, а платформа
+     * всё это время отдавала {@code solvedTasks} и {@code points}. Профиль
+     * показывал нули при трёх зачтённых задачах, и ни одна проверка этого не
+     * поймала: тест сверял клиент сам с собой.
+     * <p>
+     * Правило отсюда: фикстуру для чужого контракта берут у владельца
+     * контракта. Придуманная фикстура проверяет фантазию автора.
+     */
     private static final String PROFILE = """
-            {"forgeId":"stream-forge","tasksSolved":12,"totalPoints":47,
+            {"forgeId":"stream-forge","forgeName":"Stream Forge",
+             "solvedTasks":12,"points":47,
              "axes":{
-               "SEQ":{"score":4.2,"ceiling":5,"foundation":0.6},
-               "JOIN":{"score":1.5,"ceiling":2,"foundation":0.25}
+               "SEQ":{"score":4.2,"ceiling":5,"creditedCeiling":4.6,"workload":3.1,"foundation":0.6},
+               "JOIN":{"score":1.5,"ceiling":2,"creditedCeiling":1.8,"workload":1.2,"foundation":0.25}
              }}""";
 
     @Test
@@ -88,16 +103,30 @@ class ProfileCommandTest {
         // Человек только зарегистрировался. Нули по восьми осям выглядели бы
         // как поражение на старте.
         command.print("stream-forge", """
-                {"forgeId":"stream-forge","tasksSolved":0,"totalPoints":0,"axes":{}}""");
+                {"forgeId":"stream-forge","solvedTasks":0,"points":0,"axes":{}}""");
 
         assertThat(printed()).contains("Профиль пуст");
+    }
+
+    @Test
+    @DisplayName("🔴 задачи засчитаны, но осей нет — НЕ «решите первую задачу»")
+    void solvedWithoutAxesIsExplained() {
+        // Слой code не несёт разметки осей по устройству корпуса. Сказать
+        // «решите первую задачу» человеку, решившему три, значит соврать
+        // и отправить его искать несуществующую поломку.
+        command.print("stream-forge", """
+                {"forgeId":"stream-forge","solvedTasks":3,"points":0,"axes":{}}""");
+
+        assertThat(printed())
+                .contains("Решено задач: 3")
+                .contains("не несут осей");
     }
 
     @Test
     @DisplayName("🔴 ответ без осей вообще — не падаем")
     void survivesMissingAxes() {
         command.print("stream-forge", """
-                {"forgeId":"stream-forge","tasksSolved":0,"totalPoints":0}""");
+                {"forgeId":"stream-forge","solvedTasks":0,"points":0}""");
 
         assertThat(printed()).contains("Профиль пуст");
     }

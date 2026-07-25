@@ -7,7 +7,7 @@
 
     <groupId>io.hammerhall</groupId>
     <artifactId>hammerhall-cli</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
     <packaging>jar</packaging>
 
     <name>Hammerhall CLI</name>
@@ -52,7 +52,7 @@
     </dependencyManagement>
 
     <dependencies>
-        <!-- Только для тестов. В cli-0.1.0.jar не едет. -->
+        <!-- Только для тестов. В cli-0.1.1.jar не едет. -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>

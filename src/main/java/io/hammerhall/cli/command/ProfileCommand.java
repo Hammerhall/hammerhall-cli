@@ -60,8 +60,14 @@ public class ProfileCommand {
      * ломается молча при смене формы ответа.
      */
     void print(String forgeId, String response) {
-        long solved = Json.number(response, "tasksSolved", 0);
-        long points = Json.number(response, "totalPoints", 0);
+        // ⚠️ Имена полей — КОНТРАКТ ПЛАТФОРМЫ, а не наши предпочтения:
+        // ProfileController.ProfileResponse отдаёт solvedTasks и points.
+        // Раньше здесь стояли tasksSolved и totalPoints — имена изнутри
+        // клиента, — и Json.number молча возвращал значения по умолчанию.
+        // Профиль показывал нули при трёх зачтённых задачах: ни ошибки,
+        // ни предупреждения, просто ноль. Сверять с сервером, не выдумывать.
+        long solved = Json.number(response, "solvedTasks", 0);
+        long points = Json.number(response, "points", 0);
 
         console.print("");
         console.print("Кузница: " + forgeId);
@@ -72,9 +78,17 @@ public class ProfileCommand {
         // Имена осей — ключи объекта axes, отдельного списка нет.
         List<String> axes = axisNames(response);
         if (axes.isEmpty()) {
-            // Пустой профиль — не ошибка. Человек мог только что
-            // зарегистрироваться, и «нет данных» честнее, чем нули по осям.
-            console.dim("Профиль пуст — реши первую задачу.");
+            // Пустой вектор — не ошибка, но причины у него две разные,
+            // и путать их нельзя.
+            if (solved > 0) {
+                // Задачи засчитаны, а осей нет: у слоя code разметки осей
+                // не бывает по устройству корпуса. Сказать «реши первую
+                // задачу» человеку, решившему три, — значит соврать ему
+                // в лицо и заставить искать несуществующую поломку.
+                console.dim("Засчитанные задачи не несут осей — вектор пока пуст.");
+            } else {
+                console.dim("Профиль пуст — решите первую задачу.");
+            }
             return;
         }
 
