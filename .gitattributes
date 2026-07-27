@@ -1,0 +1,23 @@
+# Единая политика окончаний строк. Репозиторий выкладывается на Linux —
+# в истории всё хранится с LF; рабочее дерево тоже LF, кроме файлов,
+# которым CRLF нужен по природе (батники Windows).
+
+# По умолчанию: определять текст автоматически, в рабочем дереве — LF.
+* text=auto eol=lf
+
+# Скрипты Windows обязаны быть CRLF, иначе cmd поймёт их неверно.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# Unix-обёртка Maven — строго LF: CRLF ломает shebang.
+mvnw   text eol=lf
+
+# Бинарники не трогать никогда.
+*.jar   binary
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.class binary
