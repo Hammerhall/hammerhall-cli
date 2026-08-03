@@ -33,13 +33,14 @@ public final class Main {
     private static final String USAGE = """
             Hammerhall — клиент кузницы
 
-              hammerhall login              сохранить токен доступа
+              hammerhall login              войти по почте и паролю
+              hammerhall login --token      вставить ключ из личного кабинета
               hammerhall pull <задача>      забрать задачу в свой проект
               hammerhall submit <файл>      отправить решение на проверку
               hammerhall profile [кузница]  показать профиль
 
-            Токен выдаётся при регистрации на сайте и показывается ОДИН раз.
-            Потеряли — перевыпустите в личном кабинете.
+            Почта и пароль — те же, что на сайте hammerhall.io. Ключ доступа
+            клиент получает и хранит сам; видеть его вам не нужно.
             """;
 
     private Main() {

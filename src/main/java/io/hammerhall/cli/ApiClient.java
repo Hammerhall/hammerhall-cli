@@ -42,7 +42,10 @@ public class ApiClient {
     private static final Duration RESPONSE_TIMEOUT = Duration.ofMinutes(2);
 
     private final String baseUrl;
+
+    /** Ключ доступа или {@code null} — для ручек, которые зовут ДО его получения. */
     private final String token;
+
     private final HttpClient http;
 
     public ApiClient(String baseUrl, String token) {
@@ -52,6 +55,28 @@ public class ApiClient {
                 .connectTimeout(Duration.ofSeconds(10))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
+    }
+
+    /**
+     * Клиент без ключа — для {@code POST /auth/token}.
+     *
+     * <h3>Почему отдельный конструктор, а не {@code null} вторым аргументом</h3>
+     *
+     * Анонимный вызов у клиента ровно один, и он должен быть виден в коде
+     * как решение, а не как случайно не переданный параметр. {@code null}
+     * в аргументе читается одинаково и когда так задумано, и когда забыли.
+     *
+     * <p>⚠️ Заголовок {@code Authorization} при этом НЕ ставится вовсе —
+     * ни пустой, ни {@code Bearer null}. Фильтр платформы к негодному
+     * значению снисходителен (не аутентифицирует и пропускает дальше),
+     * так что вреда не было бы и от мусора, но полагаться на чужую
+     * снисходительность — значит зависеть от того, чего мы не контролируем.
+     *
+     * <p>🔑 CSRF здесь не нужен: {@code /auth/token} освобождён от него
+     * в {@code SecurityConfig} — ручка авторизуется телом и куки не ставит.
+     */
+    public ApiClient(String baseUrl) {
+        this(baseUrl, null);
     }
 
     public String get(String path) {
@@ -65,11 +90,15 @@ public class ApiClient {
     }
 
     private String send(HttpRequest.Builder builder) {
-        HttpRequest request = builder
-                .header("Authorization", "Bearer " + token)
-                .header("Accept", "application/json")
-                .timeout(RESPONSE_TIMEOUT)
-                .build();
+        builder.header("Accept", "application/json").timeout(RESPONSE_TIMEOUT);
+
+        // Ключа нет — заголовка нет. Единственный такой вызов: обмен почты
+        // и пароля на ключ, то есть шаг, на котором ключа ещё неоткуда взяться.
+        if (token != null && !token.isBlank()) {
+            builder.header("Authorization", "Bearer " + token);
+        }
+
+        HttpRequest request = builder.build();
 
         HttpResponse<String> response;
         try {
@@ -94,17 +123,25 @@ public class ApiClient {
 
         // Коды переводим в человеческие фразы. Голое «HTTP 404» ничего
         // не объясняет тому, кто просто решает задачу.
+        //
+        // 🔑 Число едет вместе с фразой: у ручки выдачи ключа тот же 401
+        // означает другое, и LoginCommand переформулирует его сам. Здесь —
+        // умолчание, верное для остальных команд.
         throw new CliException(switch (status) {
+            // ⚠️ Здесь стояло «перевыпустите в личном кабинете» — кнопки там
+            // нет до сих пор, и совет отправлял человека искать несуществующее.
+            // Ключ теперь берёт сам клиент, поэтому единственное верное
+            // указание — повторить вход.
             case 401 -> """
-                    Токен не принят. Возможно, он устарел или скопирован не полностью.
-                    Перевыпустите в личном кабинете и выполните: hammerhall login""";
+                    Ключ не принят. Возможно, он отозван сменой пароля или устарел.
+                    Выполните: hammerhall login""";
             case 403 -> "Доступ закрыт: " + message(response.body());
             case 404 -> notFound(response);
             case 413 -> "Файл слишком большой для проверки";
             case 429 -> tooManyRequests(response);
             case 503 -> temporarilyBusy(response);
             default -> "Платформа ответила " + status + ": " + message(response.body());
-        });
+        }, status);
     }
 
     /**

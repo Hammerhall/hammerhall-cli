@@ -3,13 +3,20 @@ package io.hammerhall.cli;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -97,9 +104,16 @@ class ApiClientTest {
     void explainsUnauthorized() throws IOException {
         ApiClient client = clientFor(401, "{}");
 
+        // ⚠️ Формулировка изменилась 03.08 вместе с переездом ключей.
+        // Было: «Токен не принят … перевыпустите в личном кабинете» — совет
+        // отправлял человека к кнопке, которой не существует. Стало: причина
+        // (отзыв сменой пароля) и единственное действие, которое помогает.
+        //
+        // 🔑 Этот тест и должен был упасть при такой правке: слова отказа —
+        // часть интерфейса продукта, и менять их молча нельзя.
         assertThatThrownBy(() -> client.get("/profile"))
                 .isInstanceOf(CliException.class)
-                .hasMessageContaining("Токен не принят")
+                .hasMessageContaining("Ключ не принят")
                 .hasMessageContaining("hammerhall login");
     }
 
@@ -177,5 +191,143 @@ class ApiClientTest {
                 .isInstanceOf(CliException.class)
                 .hasMessageContaining("418")
                 .hasMessageContaining("я чайник");
+    }
+
+    /**
+     * Что человек видит, когда ответа нет вовсе.
+     *
+     * <h3>🔴 Почему эти три случая нельзя было оставлять непроверенными</h3>
+     *
+     * Все предыдущие тесты описывают платформу, которая ОТВЕТИЛА — пусть
+     * отказом, но ответила. Здесь ответа нет: стенд лежит, сеть отвалилась,
+     * человек нажал Ctrl-C. Это самые частые события из всех, что случаются
+     * с клиентом, и до 03.08 ни одно не было пройдено ни разу.
+     *
+     * <p>Цена молчания тут высокая: человек, увидевший стектрейс вместо
+     * «Платформа недоступна», решит, что сломал что-то сам, и пойдёт искать
+     * ошибку в своём решении.
+     *
+     * <h3>Как это воспроизводится по-настоящему</h3>
+     *
+     * Без единого мока. Закрытый порт даёт отказ соединения; сокет, который
+     * принял и молча закрылся, — обрыв на середине; медленный ответ плюс
+     * прерывание потока — третий случай.
+     */
+    @Nested
+    @DisplayName("🔴 когда ответа нет: сеть, обрыв, прерывание")
+    @Timeout(30)
+    class WhenNetworkFails {
+
+        /** Порт, который точно никто не слушает: заняли и сразу отпустили. */
+        private int closedPort() throws IOException {
+            try (ServerSocket probe = new ServerSocket(0)) {
+                return probe.getLocalPort();
+            }
+        }
+
+        @Test
+        @DisplayName("платформа не отвечает — называем АДРЕС, по которому стучались")
+        void explainsConnectionRefused() throws IOException {
+            String baseUrl = "http://localhost:" + closedPort();
+
+            assertThatThrownBy(() -> new ApiClient(baseUrl, "test-token-a1b2c3").get("/profile"))
+                    .isInstanceOf(CliException.class)
+                    .hasMessageContaining("Платформа недоступна")
+                    // Адрес в сообщении обязателен: половина таких случаев —
+                    // это забытая строка api=http://localhost:8080 в конфиге
+                    // после отладки, и увидеть её можно только здесь.
+                    .hasMessageContaining(baseUrl);
+        }
+
+        @Test
+        @DisplayName("соединение оборвалось на середине — «Сбой связи», а не стектрейс")
+        void explainsBrokenConnection() throws Exception {
+            try (ServerSocket rude = new ServerSocket(0)) {
+                // ⚠️ Принимаем в ЦИКЛЕ, а не однократно. HttpClient ПОВТОРЯЕТ
+                // идемпотентный запрос, если соединение закрылось до ответа,
+                // а прослушивающий сокет принимает подключение в очередь ядра
+                // и без нашего accept(). Прими мы один раз — повтор соединился
+                // бы успешно и ждал ответа до таймаута в две минуты. Ровно на
+                // этом сборка и вставала 03.08.
+                Thread accepting = new Thread(() -> {
+                    while (!rude.isClosed()) {
+                        try (Socket accepted = rude.accept()) {
+                            accepted.setSoLinger(true, 0);   // рвём, а не прощаемся
+                        } catch (IOException stopped) {
+                            return;                          // сокет закрыт — уходим
+                        }
+                    }
+                });
+                accepting.setDaemon(true);
+                accepting.start();
+
+                String baseUrl = "http://localhost:" + rude.getLocalPort();
+                assertThatThrownBy(() -> new ApiClient(baseUrl, "test-token-a1b2c3").get("/profile"))
+                        .isInstanceOf(CliException.class)
+                        .hasMessageContaining("Сбой связи");
+            }
+        }
+
+        @Test
+        @DisplayName("🔑 прерывание — «Прервано» И восстановленный флаг потока")
+        void restoresInterruptFlag() throws Exception {
+            CountDownLatch requestReceived = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+
+            server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+            server.createContext("/", exchange -> {
+                requestReceived.countDown();
+                try {
+                    // Держим ответ, пока тест не отпустит. Латч, а не sleep:
+                    // обработчик не должен пережить тест и мешать stop().
+                    release.await(20, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+            });
+            server.start();
+
+            ApiClient client = new ApiClient(
+                    "http://localhost:" + server.getAddress().getPort(), "test-token-a1b2c3");
+
+            AtomicReference<Throwable> thrown = new AtomicReference<>();
+            AtomicBoolean flagRestored = new AtomicBoolean();
+
+            Thread worker = new Thread(() -> {
+                try {
+                    client.get("/profile");
+                } catch (Throwable t) {
+                    thrown.set(t);
+                    // Флаг читаем ЗДЕСЬ, внутри прерванного потока: снаружи
+                    // его уже не увидеть.
+                    flagRestored.set(Thread.currentThread().isInterrupted());
+                }
+            });
+            worker.start();
+
+            try {
+                assertThat(requestReceived.await(10, TimeUnit.SECONDS))
+                        .as("сервер должен был получить запрос до прерывания")
+                        .isTrue();
+                worker.interrupt();
+                worker.join(TimeUnit.SECONDS.toMillis(10));
+            } finally {
+                release.countDown();
+            }
+
+            assertThat(thrown.get())
+                    .isInstanceOf(CliException.class)
+                    .hasMessageContaining("Прервано");
+
+            // 🔑 Ради этой строки тест и написан. Проглоти клиент прерывание,
+            // не восстановив флаг, — вызывающий код (а завтра это может быть
+            // пул потоков) не узнал бы, что его просили остановиться.
+            // Проверить это иначе, чем изнутри потока, нельзя.
+            assertThat(flagRestored)
+                    .as("флаг прерывания обязан быть восстановлен")
+                    .isTrue();
+        }
     }
 }
