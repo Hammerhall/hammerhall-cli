@@ -1,6 +1,7 @@
 package io.hammerhall.cli;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -76,5 +77,88 @@ class ForgeRootTest {
                 .isInstanceOf(CliException.class)
                 .hasMessageContaining("не похоже на кузницу")
                 .hasMessageContaining("pom.xml");
+    }
+
+    /**
+     * Идентификатор кузницы.
+     *
+     * <h3>🔴 Почему это стоит проверять пятью тестами при двенадцати строках кода</h3>
+     *
+     * Значение подставляется в путь КАЖДОГО запроса: {@code /tasks/{forgeId}/…},
+     * {@code /submissions/{forgeId}}, {@code /profile/{forgeId}}. Ошибись
+     * оно — и платформа честно ответит «задача не найдена» на существующую
+     * задачу, а человек будет искать причину у себя в коде.
+     *
+     * <p>Опасен именно запасной путь. Маркера нет или он пуст — берётся имя
+     * каталога, а каталог у ученика называется как получилось при
+     * клонировании: {@code stream-forge (1)}, {@code Новая папка}, что угодно.
+     * Отказа при этом не будет: запрос уйдёт, просто в несуществующую кузницу.
+     *
+     * <p>⚠️ Во всех тестах имя каталога намеренно ОТЛИЧАЕТСЯ от содержимого
+     * маркера. Совпади они — тест «маркер читается» проходил бы и у кода,
+     * который маркер вовсе не открывает.
+     */
+    @Nested
+    @DisplayName("идентификатор кузницы")
+    class ForgeIdentifier {
+
+        private Path withMarker(Path root, String content) throws IOException {
+            Files.createDirectories(root.resolve(".hammerhall"));
+            Files.writeString(root.resolve(".hammerhall/forge"), content);
+            return root;
+        }
+
+        @Test
+        @DisplayName("маркер есть — берём его, а НЕ имя каталога")
+        void prefersMarker(@TempDir Path tmp) throws IOException {
+            Path root = tmp.resolve("папка-названная-как-попало");
+            Files.createDirectories(root);
+            withMarker(root, "stream-forge");
+
+            assertThat(ForgeRoot.forgeId(root)).isEqualTo("stream-forge");
+        }
+
+        @Test
+        @DisplayName("пробелы и перевод строки по краям маркера срезаются")
+        void trimsMarker(@TempDir Path tmp) throws IOException {
+            Path root = tmp.resolve("папка-названная-как-попало");
+            Files.createDirectories(root);
+            withMarker(root, "  stream-forge \n");
+
+            // Маркер пишет скрипт публикации, а текстовые файлы почти всегда
+            // заканчиваются переводом строки. Не срежь мы его — путь запроса
+            // стал бы /tasks/stream-forge%0A/…
+            assertThat(ForgeRoot.forgeId(root)).isEqualTo("stream-forge");
+        }
+
+        @Test
+        @DisplayName("маркера нет — запасной путь: имя каталога")
+        void fallsBackToDirectoryName(@TempDir Path tmp) throws IOException {
+            Path root = tmp.resolve("stream-forge");
+            Files.createDirectories(root);
+
+            assertThat(ForgeRoot.forgeId(root)).isEqualTo("stream-forge");
+        }
+
+        @Test
+        @DisplayName("🔴 маркер пуст — тоже запасной путь, а не пустой идентификатор")
+        void fallsBackWhenMarkerBlank(@TempDir Path tmp) throws IOException {
+            Path root = tmp.resolve("stream-forge");
+            Files.createDirectories(root);
+            withMarker(root, "   \n");
+
+            // Пустой идентификатор дал бы путь /tasks//MovCode0002 — платформа
+            // ответила бы 404, и причину искали бы где угодно, только не здесь.
+            assertThat(ForgeRoot.forgeId(root)).isEqualTo("stream-forge");
+        }
+
+        @Test
+        @DisplayName("маркер — каталог, а не файл: запасной путь без падения")
+        void survivesMarkerBeingDirectory(@TempDir Path tmp) throws IOException {
+            Path root = tmp.resolve("stream-forge");
+            Files.createDirectories(root.resolve(".hammerhall/forge"));
+
+            assertThat(ForgeRoot.forgeId(root)).isEqualTo("stream-forge");
+        }
     }
 }

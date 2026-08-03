@@ -147,7 +147,17 @@ public class SubmitCommand {
      * Найти файл: по пути, если он существует, иначе поиском по имени
      * внутри {@code src/main/java}.
      */
-    private Path locate(Path root, String argument) throws IOException {
+    /**
+     * Найти файл решения по тому, что человек написал в командной строке.
+     *
+     * <p>Порядок попыток: путь как есть, путь от корня кузницы, поиск по имени
+     * внутри {@code src/main/java}. Последнее и есть обещание README — «полный
+     * путь помнить не нужно».
+     *
+     * <p>Пакетная видимость — ради теста. Здесь живёт вся логика поиска
+     * и все четыре режима отказа, а вызывается она при каждой отправке.
+     */
+    Path locate(Path root, String argument) throws IOException {
         Path direct = Path.of(argument);
         if (Files.isRegularFile(direct)) {
             return direct;
@@ -189,12 +199,30 @@ public class SubmitCommand {
         return found.getFirst();
     }
 
-    private String taskIdOf(Path file) {
+    /**
+     * Идентификатор задачи — это имя файла без расширения.
+     *
+     * <p>⚠️ Берётся именно имя, а не то, что человек ввёл: путь
+     * {@code src/main/java/io/…/MovCode0002.java} обязан дать
+     * {@code MovCode0002}, иначе решение уедет под несуществующим номером
+     * и платформа ответит «задача не найдена» на существующую задачу.
+     *
+     * <p>Пакетная видимость — ради теста.
+     */
+    String taskIdOf(Path file) {
         String name = file.getFileName().toString();
         return name.endsWith(".java") ? name.substring(0, name.length() - ".java".length()) : name;
     }
 
-    private String read(Path file) {
+    /**
+     * Прочитать решение целиком.
+     *
+     * <p>Потолок размера — не экономия, а защита от опечатки: указали
+     * не тот файл, и в тело запроса уехал бы гигабайт.
+     *
+     * <p>Пакетная видимость — ради теста.
+     */
+    String read(Path file) {
         try {
             byte[] bytes = Files.readAllBytes(file);
             if (bytes.length > MAX_CODE_BYTES) {

@@ -182,7 +182,22 @@ public class PullCommand {
 
     // ---------- вывод ----------
 
-    private void report(String response, String taskId, Path relativePath) {
+    /**
+     * Показать, что забрали, и куда положили.
+     *
+     * <p>Пакетная видимость — ради теста, по той же причине, что и
+     * {@code ProfileCommand.print}: здесь весь разбор ответа платформы
+     * и всё форматирование, то есть ровно то, что ломается молча.
+     * Переименуй платформа поле {@code displayName} — человек увидит
+     * голый номер задачи вместо названия, и никакой ошибки при этом
+     * не произойдёт.
+     *
+     * <p>⚠️ Все три поля необязательны, и каждое отсутствующее меняет
+     * форму вывода. Собрать «ступень 3 · ведущая ось …» из того, чего
+     * нет, легко: разделитель повиснет в воздухе, а {@code null}
+     * напечатается словом.
+     */
+    void report(String response, String taskId, Path relativePath) {
         String name = Json.string(response, "displayName");
         String stage = Json.string(response, "stage");
         String leadAxis = Json.string(response, "leadAxis");

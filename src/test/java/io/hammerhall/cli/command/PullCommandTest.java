@@ -1,12 +1,15 @@
 package io.hammerhall.cli.command;
 
 import io.hammerhall.cli.CliException;
+import io.hammerhall.cli.Console;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -90,6 +93,28 @@ class PullCommandTest {
             assertThat(PullCommand.packageOf("public class A {}")).isNull();
             assertThat(PullCommand.packageOf("import java.util.List;\npublic class A {}")).isNull();
         }
+
+        @Test
+        @DisplayName("сканирование останавливается на ЛЮБОМ объявлении типа")
+        void stopsAtEveryDeclarationKeyword() {
+            // Четыре слова-ограничителя в коде, а проверялись два. Каждое
+            // означает «дальше объявления пакета быть не может»; пропусти
+            // клиент одно — он продолжил бы читать тело класса и мог бы
+            // принять за пакет слово из строкового литерала.
+            assertThat(PullCommand.packageOf("class A {}")).isNull();
+            assertThat(PullCommand.packageOf("final class A {}")).isNull();
+            assertThat(PullCommand.packageOf("abstract class A {}")).isNull();
+        }
+
+        @Test
+        @DisplayName("🔑 объявление НИЖЕ ограничителя не подхватывается")
+        void ignoresPackageAfterDeclaration() {
+            // Положительный контроль к предыдущему тесту: он проверяет, что
+            // вернулся null, а этот — что null вернулся ИМЕННО из-за
+            // остановки, а не потому что метод не нашёл бы пакет и так.
+            assertThat(PullCommand.packageOf("class A {}\npackage io.чужой;")).isNull();
+            assertThat(PullCommand.packageOf("package io.свой;\nclass A {}")).isEqualTo("io.свой");
+        }
     }
 
     @Nested
@@ -171,6 +196,139 @@ class PullCommandTest {
                     .doesNotThrowAnyException();
 
             assertThat(Files.readString(target)).isEqualTo(SOURCE);
+        }
+    }
+
+    /**
+     * Что человек видит после успешного {@code pull}.
+     *
+     * <h3>Почему это не «просто печать»</h3>
+     *
+     * Здесь разбирается ответ платформы: {@code displayName}, {@code stage},
+     * {@code leadAxis}. Все три необязательны, и каждое отсутствующее меняет
+     * форму строки. Собрать «ступень 3 · ведущая ось Композиция» из того,
+     * чего нет, — дело одной забытой проверки: разделитель повиснет
+     * в воздухе, а отсутствующее поле напечатается словом {@code null}.
+     *
+     * <p>🔑 Тот же довод, по которому покрыт {@code ProfileCommand.print}:
+     * клиент вырезает поля по именам, платформа их переименовывает
+     * молча, и расхождение не даёт ни ошибки, ни отказа — только
+     * обеднённый вывод, который никто не заметит.
+     */
+    @Nested
+    @DisplayName("что показываем после того, как забрали")
+    class Report {
+
+        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        private final ByteArrayOutputStream err = new ByteArrayOutputStream();
+
+        private final PullCommand command = new PullCommand(new Console(
+                new PrintStream(out, true, StandardCharsets.UTF_8),
+                new PrintStream(err, true, StandardCharsets.UTF_8)));
+
+        /** Вывод без управляющих последовательностей цвета. */
+        private String printed() {
+            return (out.toString(StandardCharsets.UTF_8) + err.toString(StandardCharsets.UTF_8))
+                    .replaceAll("\u001B\\[[0-9;]*m", "");
+        }
+
+        private Path path() {
+            return Path.of("src/main/java/io/hammerhall/task/MovCode0002.java");
+        }
+
+        @Test
+        @DisplayName("всё на месте — название, путь, ступень с осью и подсказка")
+        void printsEverything() {
+            command.report("""
+                    {"displayName":"Фильмы одного года","stage":"3",
+                     "leadAxis":"Композиция","source":"class A {}"}""",
+                    "MovCode0002", path());
+
+            assertThat(printed())
+                    .contains("MovCode0002 — Фильмы одного года")
+                    .contains("MovCode0002.java")
+                    .contains("ступень 3")
+                    .contains("ведущая ось Композиция")
+                    .contains("·")
+                    .contains("hammerhall submit MovCode0002.java");
+        }
+
+        @Test
+        @DisplayName("🔴 названия нет — печатаем номер, а не слово null")
+        void survivesMissingName() {
+            command.report("""
+                    {"stage":"3","source":"class A {}"}""", "MovCode0002", path());
+
+            assertThat(printed())
+                    .contains("MovCode0002")
+                    .doesNotContain("null")
+                    // Тире появляется только вместе с названием: без этой
+                    // проверки строка «MovCode0002 — » выглядела бы успехом.
+                    .doesNotContain("MovCode0002 —");
+        }
+
+        @Test
+        @DisplayName("🔴 только ступень — без разделителя, повисшего в воздухе")
+        void printsStageAlone() {
+            command.report("""
+                    {"displayName":"Фильмы","stage":"3","source":"class A {}"}""",
+                    "MovCode0002", path());
+
+            assertThat(printed())
+                    .contains("ступень 3")
+                    .doesNotContain("·")
+                    .doesNotContain("ведущая ось");
+        }
+
+        @Test
+        @DisplayName("только ведущая ось — тоже без разделителя")
+        void printsAxisAlone() {
+            command.report("""
+                    {"displayName":"Фильмы","leadAxis":"Композиция","source":"class A {}"}""",
+                    "MovCode0002", path());
+
+            assertThat(printed())
+                    .contains("ведущая ось Композиция")
+                    .doesNotContain("·")
+                    .doesNotContain("ступень");
+        }
+
+        @Test
+        @DisplayName("ни ступени, ни оси — строки описания нет вовсе")
+        void omitsDescriptionEntirely() {
+            command.report("""
+                    {"displayName":"Фильмы","source":"class A {}"}""",
+                    "MovCode0002", path());
+
+            assertThat(printed())
+                    .contains("MovCode0002 — Фильмы")
+                    .doesNotContain("ступень")
+                    .doesNotContain("ведущая ось")
+                    .doesNotContain("·");
+        }
+
+        @Test
+        @DisplayName("🔑 подсказка про submit есть всегда — это следующий шаг человека")
+        void alwaysTellsWhatToDoNext() {
+            // Ответ пустой настолько, насколько это возможно: даже тогда
+            // человек обязан узнать, чем продолжить.
+            command.report("{}", "WldCode0007", path());
+
+            assertThat(printed()).contains("hammerhall submit WldCode0007.java");
+        }
+
+        @Test
+        @DisplayName("пустые строки в полях считаются отсутствием, а не значением")
+        void treatsBlankAsMissing() {
+            command.report("""
+                    {"displayName":"  ","stage":"","leadAxis":"  ","source":"class A {}"}""",
+                    "MovCode0002", path());
+
+            assertThat(printed())
+                    .contains("MovCode0002")
+                    .doesNotContain("—")
+                    .doesNotContain("ступень")
+                    .doesNotContain("ведущая ось");
         }
     }
 }

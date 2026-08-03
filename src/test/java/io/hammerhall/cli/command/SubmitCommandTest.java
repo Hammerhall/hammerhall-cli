@@ -1,14 +1,21 @@
 package io.hammerhall.cli.command;
 
+import io.hammerhall.cli.CliException;
 import io.hammerhall.cli.Console;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Вердикт: что человек видит и с каким кодом выходит команда.
@@ -144,5 +151,171 @@ class SubmitCommandTest {
 
         assertThat(code).isEqualTo(1);
         assertThat(printed()).contains("FAILED");
+    }
+
+    /**
+     * Поиск файла решения.
+     *
+     * <h3>Почему это важнее вердикта</h3>
+     *
+     * README обещает: «Файл ищется по имени внутри {@code src/main/java},
+     * полный путь помнить не нужно». Обещание исполняет {@code locate},
+     * и до 03.08 оно не проверялось ничем — 122 инструкции на нуле, самая
+     * крупная непокрытая логика клиента. При этом путь проходится при
+     * КАЖДОЙ отправке, а ошибиться он может четырьмя способами.
+     *
+     * <h3>🔑 Отказ «файлов несколько» — не придирчивость</h3>
+     *
+     * Два файла с одним именем в разных пакетах — это разные задачи. Выбери
+     * клиент любой из них сам, человек отправил бы не то решение и получил
+     * непонятный вердикт по чужой задаче. Поэтому он отказывается и
+     * показывает оба пути.
+     */
+    @Nested
+    @DisplayName("поиск файла решения")
+    class Locating {
+
+        /** Кузница: корень с каталогом исходников. */
+        private Path forge(Path root, String... relativeFiles) throws IOException {
+            for (String relative : relativeFiles) {
+                Path file = root.resolve(relative);
+                Files.createDirectories(file.getParent());
+                Files.writeString(file, "class A {}", UTF_8);
+            }
+            return root;
+        }
+
+        @Test
+        @DisplayName("путь как есть — берём его, ничего не ища")
+        void findsByDirectPath(@TempDir Path root) throws IOException {
+            forge(root, "src/main/java/io/task/MovCode0002.java");
+            Path file = root.resolve("src/main/java/io/task/MovCode0002.java");
+
+            assertThat(command.locate(root, file.toString())).isEqualTo(file);
+        }
+
+        @Test
+        @DisplayName("путь от корня кузницы — тоже без поиска")
+        void findsByPathFromRoot(@TempDir Path root) throws IOException {
+            forge(root, "src/main/java/io/task/MovCode0002.java");
+
+            Path found = command.locate(root, "src/main/java/io/task/MovCode0002.java");
+
+            assertThat(found).isEqualTo(root.resolve("src/main/java/io/task/MovCode0002.java"));
+        }
+
+        @Test
+        @DisplayName("🔑 одно имя без расширения — обещание README")
+        void findsByBareName(@TempDir Path root) throws IOException {
+            forge(root, "src/main/java/io/hammerhall/task/MovCode0002.java");
+
+            Path found = command.locate(root, "MovCode0002");
+
+            assertThat(found).isEqualTo(
+                    root.resolve("src/main/java/io/hammerhall/task/MovCode0002.java"));
+        }
+
+        @Test
+        @DisplayName("имя с расширением — то же самое")
+        void findsByNameWithExtension(@TempDir Path root) throws IOException {
+            forge(root, "src/main/java/io/hammerhall/task/MovCode0002.java");
+
+            Path found = command.locate(root, "MovCode0002.java");
+
+            assertThat(found).isEqualTo(
+                    root.resolve("src/main/java/io/hammerhall/task/MovCode0002.java"));
+        }
+
+        @Test
+        @DisplayName("🔴 файлов несколько — отказ с перечислением, а не угадывание")
+        void refusesWhenAmbiguous(@TempDir Path root) throws IOException {
+            forge(root,
+                    "src/main/java/io/first/MovCode0002.java",
+                    "src/main/java/io/second/MovCode0002.java");
+
+            assertThatThrownBy(() -> command.locate(root, "MovCode0002"))
+                    .isInstanceOf(CliException.class)
+                    .hasMessageContaining("несколько")
+                    // Оба пути обязаны быть в сообщении: без них человек
+                    // не знает, какой из них указать целиком.
+                    .hasMessageContaining("first")
+                    .hasMessageContaining("second")
+                    .hasMessageContaining("Укажите путь целиком");
+        }
+
+        @Test
+        @DisplayName("файла нет — сказано, какое имя искали")
+        void refusesWhenMissing(@TempDir Path root) throws IOException {
+            forge(root, "src/main/java/io/task/MovCode0001.java");
+
+            assertThatThrownBy(() -> command.locate(root, "MovCode0002"))
+                    .isInstanceOf(CliException.class)
+                    .hasMessageContaining("MovCode0002.java");
+        }
+
+        @Test
+        @DisplayName("нет src/main/java — подсказываем, что каталог не тот")
+        void refusesOutsideForge(@TempDir Path root) {
+            assertThatThrownBy(() -> command.locate(root, "MovCode0002"))
+                    .isInstanceOf(CliException.class)
+                    .hasMessageContaining("src/main/java");
+        }
+    }
+
+    /**
+     * Идентификатор задачи и чтение файла.
+     *
+     * <p>Обе функции чистые и обе едут прямо в запрос: первая — в путь
+     * {@code /submit/{taskId}}, вторая — в тело.
+     */
+    @Nested
+    @DisplayName("идентификатор задачи и чтение")
+    class Reading {
+
+        @Test
+        @DisplayName("🔴 идентификатор — имя файла без расширения и БЕЗ пути")
+        void takesFileNameOnly(@TempDir Path root) {
+            // Уедь сюда путь целиком, платформа ответила бы «задача
+            // не найдена» на существующую задачу.
+            assertThat(command.taskIdOf(root.resolve("src/main/java/io/t/MovCode0002.java")))
+                    .isEqualTo("MovCode0002");
+        }
+
+        @Test
+        @DisplayName("имя без расширения остаётся как есть")
+        void keepsNameWithoutExtension(@TempDir Path root) {
+            assertThat(command.taskIdOf(root.resolve("MovCode0002"))).isEqualTo("MovCode0002");
+        }
+
+        @Test
+        @DisplayName("файл читается как UTF-8 — кириллица в комментарии цела")
+        void readsUtf8(@TempDir Path root) throws IOException {
+            Path file = root.resolve("MovCode0002.java");
+            Files.writeString(file, "// решение задачи\nclass A {}", UTF_8);
+
+            assertThat(command.read(file)).contains("решение задачи");
+        }
+
+        @Test
+        @DisplayName("🔴 файл больше потолка — отказ до отправки, а не гигабайт в запросе")
+        void refusesHugeFile(@TempDir Path root) throws IOException {
+            Path file = root.resolve("MovCode0002.java");
+            Files.write(file, new byte[256 * 1024 + 1]);
+
+            assertThatThrownBy(() -> command.read(file))
+                    .isInstanceOf(CliException.class)
+                    .hasMessageContaining("256");
+        }
+
+        @Test
+        @DisplayName("ровно на потолке — ещё принимается (граница включительно)")
+        void acceptsExactlyAtLimit(@TempDir Path root) throws IOException {
+            // Положительный контроль к предыдущему: без него отказ,
+            // срабатывающий на любом размере, выглядел бы правильным.
+            Path file = root.resolve("MovCode0002.java");
+            Files.write(file, new byte[256 * 1024]);
+
+            assertThat(command.read(file)).hasSize(256 * 1024);
+        }
     }
 }
