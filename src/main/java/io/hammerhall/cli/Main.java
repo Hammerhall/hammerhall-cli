@@ -13,7 +13,7 @@ import java.nio.charset.StandardCharsets;
  * Точка входа клиента.
  *
  * <h3>Что это такое</h3>
- *
+ * <p>
  * Курьер между папкой пользователя и платформой. Читает файл, отправляет
  * текст, печатает ответ. Больше ничего.
  *
@@ -23,22 +23,22 @@ import java.nio.charset.StandardCharsets;
  * программу у всех, у кого она стоит.
  *
  * <h3>Живёт внутри кузницы</h3>
- *
+ * <p>
  * Не устанавливается отдельно: клонировал репозиторий — клиент уже здесь.
  * Отсюда три удобства даром — ставить нечего, корень проекта известен
  * (это корень репозитория), конфиг лежит рядом.
  */
 public final class Main {
 
-    private static final String USAGE = """
+    static final String USAGE = """
             Hammerhall — клиент кузницы
-
+            
               hammerhall login              войти по почте и паролю
               hammerhall login --token      вставить ключ из личного кабинета
               hammerhall pull <задача>      забрать задачу в свой проект
               hammerhall submit <файл>      отправить решение на проверку
               hammerhall profile [кузница]  показать профиль
-
+            
             Почта и пароль — те же, что на сайте hammerhall.io. Ключ доступа
             клиент получает и хранит сам; видеть его вам не нужно.
             """;
@@ -76,12 +76,17 @@ public final class Main {
                 ? System.err
                 : new PrintStream(System.err, true, StandardCharsets.UTF_8);
 
+        Console console = new Console(out, err, terminal);
+
+        // ⚠️ Справка печатается ЧЕРЕЗ console, а не в поток напрямую.
+        // Раньше здесь стоял out.print(USAGE), и она проходила мимо замены
+        // непроходимых символов: в консоли Windows длинное тире становилось
+        // вопросительным знаком — «Hammerhall ? клиент кузницы». Справка это
+        // первое, что человек читает, и чинить её последней было ошибкой.
         if (args.length == 0) {
-            out.print(USAGE);
+            console.block(USAGE);
             System.exit(1);
         }
-
-        Console console = new Console(out, err, terminal);
 
         try {
             int code = run(args, console);

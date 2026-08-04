@@ -115,6 +115,41 @@ class ConsoleTest {
         }
 
         @Test
+        @DisplayName("🔴 типографика тоже переживает cp866: тире, ёлочки, многоточие")
+        void downgradesTypography() {
+            // Первая правка меняла только ✓ ⚠ ✗ — и провалилась ровно там,
+            // где кончился список известного: длинное тире и кавычки-ёлочки
+            // остались в строках и стали '?'. Человек читал
+            // «Hammerhall ? клиент кузницы» и «?Забыли пароль??».
+            Charset cp866 = Charset.forName("IBM866");
+            PrintStream stream = stream(cp866);
+
+            new Console(stream, stream, false)
+                    .print("Hammerhall — клиент; «Забыли пароль?» на сайте… SEQ 3→4");
+
+            assertThat(printed(cp866))
+                    .contains("Hammerhall - клиент")
+                    .contains("\"Забыли пароль?\"")
+                    .contains("сайте...")
+                    .contains("SEQ 3->4")
+                    .doesNotContain("?\u0020клиент");
+        }
+
+        @Test
+        @DisplayName("🔑 в UTF-8 типографика НЕ трогается")
+        void keepsTypographyInUtf8() {
+            // Положительный контроль: замена обязана включаться только там,
+            // где без неё потеря. Сработай она всегда — мы бы молча огрубили
+            // вывод у всех, у кого и так всё было хорошо.
+            PrintStream stream = stream(StandardCharsets.UTF_8);
+
+            new Console(stream, stream, false).print("Hammerhall — клиент «кузницы»");
+
+            assertThat(printed(StandardCharsets.UTF_8))
+                    .contains("Hammerhall — клиент «кузницы»");
+        }
+
+        @Test
         @DisplayName("кириллица в cp866 доезжает целой — значки её не портят")
         void keepsCyrillicInCp866() {
             // Положительный контроль к предыдущему: он проверяет отсутствие '?',
