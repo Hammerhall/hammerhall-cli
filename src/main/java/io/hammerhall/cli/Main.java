@@ -33,32 +33,54 @@ public final class Main {
     private static final String USAGE = """
             Hammerhall — клиент кузницы
 
-              hammerhall login              войти по почте и паролю
-              hammerhall login --token      вставить ключ из личного кабинета
+              hammerhall login              сохранить токен доступа
               hammerhall pull <задача>      забрать задачу в свой проект
               hammerhall submit <файл>      отправить решение на проверку
               hammerhall profile [кузница]  показать профиль
 
-            Почта и пароль — те же, что на сайте hammerhall.io. Ключ доступа
-            клиент получает и хранит сам; видеть его вам не нужно.
+            Токен выдаётся при регистрации на сайте и показывается ОДИН раз.
+            Потеряли — перевыпустите в личном кабинете.
             """;
 
     private Main() {
     }
 
     public static void main(String[] args) {
-        // Windows по умолчанию отдаёт cp1251, и кириллица в выводе
-        // превращается в кашу. Терминал у пользователя мы не чиним,
-        // но свой вывод обязаны отдать в UTF-8.
-        PrintStream out = new PrintStream(System.out, true, StandardCharsets.UTF_8);
-        PrintStream err = new PrintStream(System.err, true, StandardCharsets.UTF_8);
+        // 🔴 Кодировка вывода на Windows: два взаимоисключающих случая.
+        //
+        // stdout привязан к НАСТОЯЩЕЙ консоли — JDK кодирует вывод её кодовой
+        // страницей сам, и делает это правильно. Обернём в UTF-8 — отдадим
+        // консоли готовые UTF-8-байты, а она прочтёт их своей страницей (866
+        // на русской Windows), и кириллица рассыплется на ╨, ╤, Ш.
+        //
+        // stdout — ТРУБА (MinTTY, конвейер, файл) — консольного преобразования
+        // нет, байты идут как есть. Здесь UTF-8 обязателен, иначе JDK возьмёт
+        // native.encoding, то есть cp1251, а принимающая сторона почти всегда
+        // ждёт UTF-8.
+        //
+        // Раньше обёртка стояла безусловно. Она чинила трубу и ломала консоль,
+        // и потому у одних работало, у других нет — при одном и том же jar
+        // и одинаково настроенном терминале.
+        //
+        // 🔑 System.console() != null для различения НЕ годится: с JDK 22
+        // метод возвращает объект и при перенаправлении. Терминал от трубы
+        // отличает только isTerminal().
+        java.io.Console jvmConsole = System.console();
+        boolean terminal = jvmConsole != null && jvmConsole.isTerminal();
+
+        PrintStream out = terminal
+                ? System.out
+                : new PrintStream(System.out, true, StandardCharsets.UTF_8);
+        PrintStream err = terminal
+                ? System.err
+                : new PrintStream(System.err, true, StandardCharsets.UTF_8);
 
         if (args.length == 0) {
             out.print(USAGE);
             System.exit(1);
         }
 
-        Console console = new Console(out, err);
+        Console console = new Console(out, err, terminal);
 
         try {
             int code = run(args, console);
