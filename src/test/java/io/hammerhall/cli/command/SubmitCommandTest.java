@@ -1,321 +1,305 @@
 package io.hammerhall.cli.command;
 
-import io.hammerhall.cli.CliException;
-import io.hammerhall.cli.Console;
+import io.hammerhall.cli.FakePlatform;
+import io.hammerhall.cli.Json;
+import io.hammerhall.cli.World;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.PrintStream;
+import java.io.RandomAccessFile;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.hammerhall.cli.FakePlatform.json;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/**
- * Вердикт: что человек видит и с каким кодом выходит команда.
- *
- * <h3>Что охраняется</h3>
- *
- * Код возврата — это интерфейс для скриптов и CI: {@code 0} значит «зачтено».
- * Ошибиться здесь значит сломать чужую автоматизацию молча.
- *
- * <p>И разбор ответа. Сводка по тестам лежит вложенным объектом, а клиент
- * вырезает его строковым поиском — поменяется форма ответа, и человек увидит
- * «0/0 тестов» вместо вердикта, решив, что виновата платформа. Такой код
- * обязан быть под тестом, иначе он ломается тихо.
- *
- * <p>Отдельно: имена упавших тестов печатаются, а сообщения ассертов — нет,
- * и это не упущение. Сервер их и не присылает: в них ожидаемые значения,
- * то есть подсказка к ответу.
- */
-@DisplayName("SubmitCommand — вердикт и код возврата")
+@DisplayName("submit — решение на проверку")
 class SubmitCommandTest {
 
-    private final ByteArrayOutputStream out = new ByteArrayOutputStream();
-    private final ByteArrayOutputStream err = new ByteArrayOutputStream();
+    private static final String CODE = "package io.x;\n// «кириллица» в комментарии\npublic class MovCode0002 {}\n";
 
-    private final SubmitCommand command = new SubmitCommand(new Console(
-            new PrintStream(out, true, UTF_8), new PrintStream(err, true, UTF_8)));
+    @TempDir
+    Path temp;
 
-    private String printed() {
-        return (out.toString(UTF_8) + err.toString(UTF_8))
-                .replaceAll("\u001B\\[[0-9;]*m", "");
+    private FakePlatform platform;
+    private World world;
+
+    @BeforeEach
+    void setUp() throws IOException {
+        platform = new FakePlatform();
+        world = new World(temp).loggedIn(platform, "k");
+        world.source("io/x/MovCode0002.java", CODE);
+    }
+
+    @AfterEach
+    void tearDown() {
+        platform.close();
     }
 
     @Test
-    @DisplayName("🔴 PASSED — код 0 и счёт тестов из вложенного объекта")
-    void passedExitsZero() {
-        int code = command.report("""
-                {"status":"PASSED","durationMs":1007,"fromHistory":false,
-                 "tests":{"total":10,"passed":10,"failed":0},"failures":[],"log":""}""");
+    @DisplayName("PASSED — код 0; тело: кузница, номер, код — с экранированием всех полей")
+    void passed() {
+        platform.on("POST", "/submit", json(200,
+                "{\"status\":\"PASSED\",\"durationMs\":1007,\"tests\":{\"total\":5,\"passed\":5},\"fromHistory\":true}"));
+        assertThat(world.run("submit", "MovCode0002.java")).isZero();
 
-        assertThat(code).isZero();
-        assertThat(printed()).contains("PASSED").contains("10/10");
+        Json.Node body = Json.parse(platform.last("POST", "/submit").body());
+        assertThat(body.get("forgeId").string()).isEqualTo("stream-forge");
+        assertThat(body.get("taskId").string()).isEqualTo("MovCode0002");
+        assertThat(body.get("code").string()).isEqualTo(CODE);
+        assertThat(world.out()).contains("PASSED — 5/5 тестов, 1007 мс").contains("из истории");
     }
 
     @Test
-    @DisplayName("🔴 FAILED — код 1 и имена упавших тестов")
-    void failedListsFailures() {
-        int code = command.report("""
-                {"status":"FAILED","durationMs":900,"fromHistory":false,
-                 "tests":{"total":10,"passed":7,"failed":3},
-                 "failures":["фильтрует чётные","сохраняет порядок"],"log":""}""");
+    @DisplayName("🔴 ВЫС-1: ответ с пробелами — «прошло 3 из 5», а не «0/0»; имена упавших тестов")
+    void prettyFailed() {
+        platform.on("POST", "/submit", json(200, """
+                {
+                  "status" : "FAILED",
+                  "tests" : { "total" : 5, "passed" : 3 },
+                  "failures" : [ "sortsByYear", "keepsTies" ]
+                }"""));
+        assertThat(world.run("submit", "MovCode0002")).isEqualTo(1);
+        assertThat(world.err()).contains("FAILED — прошло 3 из 5 тестов");
+        assertThat(world.out()).contains("· sortsByYear").contains("· keepsTies");
+    }
 
-        assertThat(code).isEqualTo(1);
-        assertThat(printed())
-                .contains("7/10")
-                .contains("фильтрует чётные")
-                .contains("сохраняет порядок");
+    @ParameterizedTest(name = "{0}")
+    @CsvSource({
+            "CRASHED, сорвалась на нашей стороне",
+            "RESOURCE_LIMIT, не уложилось в память",
+            "COMPILE_ERROR, не компилируется",
+            "STYLE_VIOLATION, не в стрим-стиле",
+            "INVALID_INPUT, отклонено до запуска",
+            "TIMEOUT, слишком долго",
+            "BRAND_NEW, клиент такого не знает"
+    })
+    @DisplayName("🔴 БЛОК-5: каждый вердикт — словами, включая CRASHED и RESOURCE_LIMIT; код 1")
+    void verdicts(String status, String words) {
+        platform.on("POST", "/submit", json(200, Json.object("status", status, "log", "строка лога 🔥")));
+        assertThat(world.run("submit", "MovCode0002")).isEqualTo(1);
+        assertThat(world.err()).contains(words);
+        if (!status.equals("TIMEOUT")) {
+            assertThat(world.out()).contains("строка лога");
+        }
     }
 
     @Test
-    @DisplayName("вердикт из истории отмечается — иначе мгновенный ответ выглядит сбоем")
-    void marksCachedVerdict() {
-        // Человек ждал секунду проверки, а получил результат сразу. Без
-        // пометки это выглядит так, будто ничего не проверялось.
-        command.report("""
-                {"status":"PASSED","durationMs":5,"fromHistory":true,
-                 "tests":{"total":3,"passed":3,"failed":0},"failures":[],"log":""}""");
-
-        assertThat(printed()).contains("из истории");
+    @DisplayName("🔴 БЛОК-5: ответ без статуса — не «Вердикт: null»")
+    void noStatus() {
+        platform.on("POST", "/submit", json(200, "{}"));
+        assertThat(world.run("submit", "MovCode0002")).isEqualTo(1);
+        assertThat(world.err()).contains("не назвала вердикт").doesNotContain("null");
     }
 
-    @Test
-    @DisplayName("не в стрим-стиле — объясняем причину и показываем лог")
-    void styleViolationShowsLog() {
-        int code = command.report("""
-                {"status":"STYLE_VIOLATION","durationMs":800,"fromHistory":false,
-                 "tests":{"total":0,"passed":0,"failed":0},"failures":[],
-                 "log":"обнаружен цикл for — задача про стримы"}""");
-
-        assertThat(code).isEqualTo(1);
-        assertThat(printed())
-                .contains("стрим-стиле")
-                .contains("обнаружен цикл for");
-    }
-
-    @Test
-    @DisplayName("не компилируется — показываем ошибку компилятора")
-    void compileErrorShowsLog() {
-        int code = command.report("""
-                {"status":"COMPILE_ERROR","durationMs":400,"fromHistory":false,
-                 "tests":{"total":0,"passed":0,"failed":0},"failures":[],
-                 "log":"MovCode0002.java:7: error: ';' expected"}""");
-
-        assertThat(code).isEqualTo(1);
-        assertThat(printed())
-                .contains("Не компилируется")
-                .contains("';' expected");
-    }
-
-    @Test
-    @DisplayName("таймаут — человеческая фраза, а не слово TIMEOUT")
-    void timeoutIsExplained() {
-        int code = command.report("""
-                {"status":"TIMEOUT","durationMs":45000,"fromHistory":false,
-                 "tests":{"total":0,"passed":0,"failed":0},"failures":[],"log":""}""");
-
-        assertThat(code).isEqualTo(1);
-        assertThat(printed()).contains("Слишком долго");
-    }
-
-    @Test
-    @DisplayName("🔴 незнакомый статус — печатаем как есть, не притворяемся, что всё хорошо")
-    void unknownStatusIsNotSuccess() {
-        // Платформа новее клиента и прислала статус, которого здесь ещё нет.
-        // Считать такое зачётом нельзя ни при каких обстоятельствах.
-        int code = command.report("""
-                {"status":"QUARANTINED","durationMs":10,"fromHistory":false,
-                 "tests":{"total":0,"passed":0,"failed":0},"failures":[],
-                 "log":"решение отложено на ручную проверку"}""");
-
-        assertThat(code).isEqualTo(1);
-        assertThat(printed())
-                .contains("QUARANTINED")
-                .contains("отложено на ручную проверку");
-    }
-
-    @Test
-    @DisplayName("🔴 ответ без сводки по тестам — не падаем")
-    void survivesMissingTestsBlock() {
-        // Форма ответа поменялась или пришёл обрезанный JSON. Вердикт
-        // всё равно должен доехать до человека, пусть и без счёта.
-        int code = command.report("""
-                {"status":"FAILED","durationMs":100,"fromHistory":false,"failures":[]}""");
-
-        assertThat(code).isEqualTo(1);
-        assertThat(printed()).contains("FAILED");
-    }
-
-    /**
-     * Поиск файла решения.
-     *
-     * <h3>Почему это важнее вердикта</h3>
-     *
-     * README обещает: «Файл ищется по имени внутри {@code src/main/java},
-     * полный путь помнить не нужно». Обещание исполняет {@code locate},
-     * и до 03.08 оно не проверялось ничем — 122 инструкции на нуле, самая
-     * крупная непокрытая логика клиента. При этом путь проходится при
-     * КАЖДОЙ отправке, а ошибиться он может четырьмя способами.
-     *
-     * <h3>🔑 Отказ «файлов несколько» — не придирчивость</h3>
-     *
-     * Два файла с одним именем в разных пакетах — это разные задачи. Выбери
-     * клиент любой из них сам, человек отправил бы не то решение и получил
-     * непонятный вердикт по чужой задаче. Поэтому он отказывается и
-     * показывает оба пути.
-     */
     @Nested
-    @DisplayName("поиск файла решения")
-    class Locating {
+    @DisplayName("🔴 БЛОК-1: очередь — 202 и опрос")
+    class Queue {
 
-        /** Кузница: корень с каталогом исходников. */
-        private Path forge(Path root, String... relativeFiles) throws IOException {
-            for (String relative : relativeFiles) {
-                Path file = root.resolve(relative);
-                Files.createDirectories(file.getParent());
-                Files.writeString(file, "class A {}", UTF_8);
+        @Test
+        @DisplayName("202 → «в очереди» → «проверяется» → вердикт; шаг — Retry-After сервера")
+        void pollsUntilVerdict() {
+            platform.on("POST", "/submit", json(202, "{\"submissionId\":\"s-42\",\"status\":\"QUEUED\"}",
+                            "Retry-After", "3"))
+                    .on("GET", "/submit/s-42",
+                            json(202, "{\"status\":\"RUNNING\"}"),
+                            json(200, "{\"status\":\"PASSED\",\"tests\":{\"total\":1,\"passed\":1}}"));
+            assertThat(world.run("submit", "MovCode0002")).isZero();
+            assertThat(world.out()).contains("В очереди").contains("Проверяется").contains("PASSED");
+            assertThat(world.sleeps).containsExactly(Duration.ofSeconds(3), Duration.ofSeconds(2));
+        }
+
+        @Test
+        @DisplayName("очередь не кончается — «решение не потеряно», код 3, а не вечное ожидание")
+        void givesUpWithHonestWords() {
+            platform.on("POST", "/submit", json(202, "{\"submissionId\":\"s-1\",\"status\":\"QUEUED\"}"))
+                    .on("GET", "/submit/s-1", json(202, "{\"status\":\"QUEUED\"}"));
+            assertThat(world.run("submit", "MovCode0002")).isEqualTo(3);
+            assertThat(world.err()).contains("Решение не потеряно");
+            assertThat(world.sleeps.stream().reduce(Duration.ZERO, Duration::plus))
+                    .isLessThanOrEqualTo(SubmitCommand.AWAIT_LIMIT);
+        }
+
+        @Test
+        @DisplayName("202 без номера — понятная ошибка")
+        void noId() {
+            platform.on("POST", "/submit", json(202, "{\"status\":\"QUEUED\"}"));
+            assertThat(world.run("submit", "MovCode0002")).isEqualTo(2);
+            assertThat(world.err()).contains("не назвала номер");
+        }
+
+        @Test
+        @DisplayName("прерывание во время ожидания — «Прервано»")
+        void interrupted() {
+            platform.on("POST", "/submit", json(202, "{\"submissionId\":\"s-1\",\"status\":\"QUEUED\"}"));
+            world.sleeps.clear();
+            World w = world;
+            io.hammerhall.cli.Args args = io.hammerhall.cli.Args.parse(new String[]{"submit", "MovCode0002"});
+            io.hammerhall.cli.Context base = w.context(args);
+            io.hammerhall.cli.Context interrupting = new io.hammerhall.cli.Context(base.console(), base.input(),
+                    w.workDir, w.home, w.env, base.clock(), d -> { throw new InterruptedException(); },
+                    "dev", null, false);
+            assertThat(io.hammerhall.cli.Main.execute(args, interrupting)).isEqualTo(2);
+            assertThat(Thread.interrupted()).isTrue();
+            assertThat(w.err()).contains("Прервано");
+        }
+    }
+
+    @Test
+    @DisplayName("🔴 СР-8: синхронный ответ не дождались — «решение не потеряно», код 3, а не «сбой связи»")
+    void slowSyncAnswer() throws Exception {
+        com.sun.net.httpserver.HttpServer slow = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("localhost", 0), 0);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        slow.createContext("/", exchange -> {
+            try {
+                release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-            return root;
-        }
-
-        @Test
-        @DisplayName("путь как есть — берём его, ничего не ища")
-        void findsByDirectPath(@TempDir Path root) throws IOException {
-            forge(root, "src/main/java/io/task/MovCode0002.java");
-            Path file = root.resolve("src/main/java/io/task/MovCode0002.java");
-
-            assertThat(command.locate(root, file.toString())).isEqualTo(file);
-        }
-
-        @Test
-        @DisplayName("путь от корня кузницы — тоже без поиска")
-        void findsByPathFromRoot(@TempDir Path root) throws IOException {
-            forge(root, "src/main/java/io/task/MovCode0002.java");
-
-            Path found = command.locate(root, "src/main/java/io/task/MovCode0002.java");
-
-            assertThat(found).isEqualTo(root.resolve("src/main/java/io/task/MovCode0002.java"));
-        }
-
-        @Test
-        @DisplayName("🔑 одно имя без расширения — обещание README")
-        void findsByBareName(@TempDir Path root) throws IOException {
-            forge(root, "src/main/java/io/hammerhall/task/MovCode0002.java");
-
-            Path found = command.locate(root, "MovCode0002");
-
-            assertThat(found).isEqualTo(
-                    root.resolve("src/main/java/io/hammerhall/task/MovCode0002.java"));
-        }
-
-        @Test
-        @DisplayName("имя с расширением — то же самое")
-        void findsByNameWithExtension(@TempDir Path root) throws IOException {
-            forge(root, "src/main/java/io/hammerhall/task/MovCode0002.java");
-
-            Path found = command.locate(root, "MovCode0002.java");
-
-            assertThat(found).isEqualTo(
-                    root.resolve("src/main/java/io/hammerhall/task/MovCode0002.java"));
-        }
-
-        @Test
-        @DisplayName("🔴 файлов несколько — отказ с перечислением, а не угадывание")
-        void refusesWhenAmbiguous(@TempDir Path root) throws IOException {
-            forge(root,
-                    "src/main/java/io/first/MovCode0002.java",
-                    "src/main/java/io/second/MovCode0002.java");
-
-            assertThatThrownBy(() -> command.locate(root, "MovCode0002"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("несколько")
-                    // Оба пути обязаны быть в сообщении: без них человек
-                    // не знает, какой из них указать целиком.
-                    .hasMessageContaining("first")
-                    .hasMessageContaining("second")
-                    .hasMessageContaining("Укажите путь целиком");
-        }
-
-        @Test
-        @DisplayName("файла нет — сказано, какое имя искали")
-        void refusesWhenMissing(@TempDir Path root) throws IOException {
-            forge(root, "src/main/java/io/task/MovCode0001.java");
-
-            assertThatThrownBy(() -> command.locate(root, "MovCode0002"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("MovCode0002.java");
-        }
-
-        @Test
-        @DisplayName("нет src/main/java — подсказываем, что каталог не тот")
-        void refusesOutsideForge(@TempDir Path root) {
-            assertThatThrownBy(() -> command.locate(root, "MovCode0002"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("src/main/java");
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        slow.start();
+        Duration standard = SubmitCommand.syncTimeout;
+        SubmitCommand.syncTimeout = Duration.ofMillis(300);
+        try {
+            String url = "http://localhost:" + slow.getAddress().getPort();
+            world.env.put("HAMMERHALL_API", url);
+            Files.writeString(world.credentials(), url + "=k\n");
+            assertThat(world.run("submit", "MovCode0002")).isEqualTo(3);
+            assertThat(world.err()).contains("Решение не потеряно").doesNotContain("Сбой связи");
+        } finally {
+            SubmitCommand.syncTimeout = standard;
+            release.countDown();
+            slow.stop(0);
         }
     }
 
-    /**
-     * Идентификатор задачи и чтение файла.
-     *
-     * <p>Обе функции чистые и обе едут прямо в запрос: первая — в путь
-     * {@code /submit/{taskId}}, вторая — в тело.
-     */
     @Nested
-    @DisplayName("идентификатор задачи и чтение")
-    class Reading {
+    @DisplayName("файл решения")
+    class TheFile {
 
         @Test
-        @DisplayName("🔴 идентификатор — имя файла без расширения и БЕЗ пути")
-        void takesFileNameOnly(@TempDir Path root) {
-            // Уедь сюда путь целиком, платформа ответила бы «задача
-            // не найдена» на существующую задачу.
-            assertThat(command.taskIdOf(root.resolve("src/main/java/io/t/MovCode0002.java")))
-                    .isEqualTo("MovCode0002");
+        @DisplayName("🔴 ВЫС-10: файл вне кузницы — не уходит никуда")
+        void outsideForge() throws IOException {
+            Path secret = world.home.resolve(".ssh/id_rsa");
+            Files.createDirectories(secret.getParent());
+            Files.writeString(secret, "-----BEGIN PRIVATE KEY-----");
+            assertThat(world.run("submit", secret.toString())).isEqualTo(2);
+            assertThat(world.err()).contains("Файл вне кузницы");
+            assertThat(world.run("submit", "../../.ssh/id_rsa")).isEqualTo(2);
+            assertThat(platform.seen()).isEmpty();
         }
 
         @Test
-        @DisplayName("имя без расширения остаётся как есть")
-        void keepsNameWithoutExtension(@TempDir Path root) {
-            assertThat(command.taskIdOf(root.resolve("MovCode0002"))).isEqualTo("MovCode0002");
+        @DisabledOnOs(OS.WINDOWS)
+        @DisplayName("🔴 ВЫС-10: ссылка из кузницы наружу — тоже вне кузницы")
+        void symlinkOut() throws IOException {
+            Path outside = Files.writeString(world.home.resolve("Outside.java"), "class Outside {}");
+            Files.createSymbolicLink(world.forge.resolve("src/main/java/Outside.java"), outside);
+            assertThat(world.run("submit", "Outside.java")).isEqualTo(2);
+            assertThat(world.err()).contains("Файл вне кузницы");
         }
 
         @Test
-        @DisplayName("файл читается как UTF-8 — кириллица в комментарии цела")
-        void readsUtf8(@TempDir Path root) throws IOException {
-            Path file = root.resolve("MovCode0002.java");
-            Files.writeString(file, "// решение задачи\nclass A {}", UTF_8);
+        @DisplayName("🔴 ВЫС-6: не UTF-8 — понятный совет, а не тихие «?» в коде; BOM срезается")
+        void encoding() throws IOException {
+            world.source("io/x/MovCode0003.java", "").toFile();
+            Files.write(world.forge.resolve("src/main/java/io/x/MovCode0003.java"),
+                    "// Привет\nclass MovCode0003 {}".getBytes(Charset.forName("windows-1251")));
+            assertThat(world.run("submit", "MovCode0003")).isEqualTo(2);
+            assertThat(world.err()).contains("не в UTF-8").contains("Convert");
 
-            assertThat(command.read(file)).contains("решение задачи");
+            platform.on("POST", "/submit", json(200, "{\"status\":\"PASSED\"}"));
+            Files.writeString(world.forge.resolve("src/main/java/io/x/MovCode0004.java"), "\uFEFFclass MovCode0004 {}");
+            assertThat(world.run("submit", "MovCode0004")).isZero();
+            assertThat(Json.parse(platform.last("POST", "/submit").body()).get("code").string())
+                    .isEqualTo("class MovCode0004 {}");
         }
 
         @Test
-        @DisplayName("🔴 файл больше потолка — отказ до отправки, а не гигабайт в запросе")
-        void refusesHugeFile(@TempDir Path root) throws IOException {
-            Path file = root.resolve("MovCode0002.java");
-            Files.write(file, new byte[256 * 1024 + 1]);
-
-            assertThatThrownBy(() -> command.read(file))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("256");
+        @DisplayName("🔴 ВЫС-4: размер проверяется ДО чтения — у файловой системы, а не у прочитанного")
+        void sizeBeforeRead() throws IOException {
+            Path huge = world.forge.resolve("src/main/java/io/x/MovCode0005.java");
+            // На байт больше потолка: этого хватает, чтобы проверить, что размер
+            // спрашивается у файловой системы, а не у прочитанного массива.
+            // (Гигабайт здесь не нужен — на NTFS он занял бы диск по-настоящему.)
+            try (RandomAccessFile file = new RandomAccessFile(huge.toFile(), "rw")) {
+                file.setLength(SubmitCommand.MAX_CODE_BYTES + 1L);
+            }
+            assertThat(world.run("submit", "MovCode0005")).isEqualTo(2);
+            assertThat(world.err()).contains("больше 256 КБ");
         }
 
         @Test
-        @DisplayName("ровно на потолке — ещё принимается (граница включительно)")
-        void acceptsExactlyAtLimit(@TempDir Path root) throws IOException {
-            // Положительный контроль к предыдущему: без него отказ,
-            // срабатывающий на любом размере, выглядел бы правильным.
-            Path file = root.resolve("MovCode0002.java");
-            Files.write(file, new byte[256 * 1024]);
-
-            assertThat(command.read(file)).hasSize(256 * 1024);
+        @DisplayName("🔴 ВЫС-9, СР-5: номер из имени файла проверяется — «копия» не ломает JSON")
+        void badFileName() throws IOException {
+            world.source("io/x/MovCode0002 (копия).java", "class X {}");
+            assertThat(world.run("submit", "MovCode0002 (копия).java")).isEqualTo(2);
+            assertThat(world.err()).contains("не похоже на номер задачи");
         }
+
+        @Test
+        @DisplayName("поиск: по имени, по пути от корня, несколько одинаковых — список; нет — понятно")
+        void locating() throws IOException {
+            platform.on("POST", "/submit", json(200, "{\"status\":\"PASSED\"}"));
+            assertThat(world.run("submit", "src/main/java/io/x/MovCode0002.java")).isZero();
+            world.workDir = world.forge.resolve("src/main/java/io");
+            assertThat(world.run("submit", "x/MovCode0002.java")).isZero();
+            world.workDir = world.forge;
+
+            world.source("io/y/MovCode0002.java", "class MovCode0002 {}");
+            assertThat(world.run("submit", "MovCode0002")).isEqualTo(2);
+            assertThat(world.err()).contains("несколько").contains("io/y/MovCode0002.java");
+
+            assertThat(world.run("submit", "Nope0001")).isEqualTo(2);
+            assertThat(world.err()).contains("Файл не найден: Nope0001.java");
+        }
+
+        @Test
+        @DisplayName("нет src/main/java — понятно")
+        void noSources() throws IOException {
+            try (var walk = Files.walk(world.forge.resolve("src"))) {
+                walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+            }
+            assertThat(world.run("submit", "MovCode0002")).isEqualTo(2);
+            assertThat(world.err()).contains("Нет каталога src/main/java");
+        }
+
+        @Test
+        @DisabledOnOs(OS.WINDOWS)
+        @DisplayName("🔴 ВЫС-5: файл не читается — слова, а не стектрейс с кодом 2 «непредвиденная»")
+        void unreadable() throws IOException {
+            Path file = world.forge.resolve("src/main/java/io/x/MovCode0002.java");
+            Files.setPosixFilePermissions(file, java.nio.file.attribute.PosixFilePermissions.fromString("---------"));
+            try {
+                org.junit.jupiter.api.Assumptions.assumeFalse(Files.isReadable(file), "под root права не мешают");
+                assertThat(world.run("submit", "MovCode0002")).isEqualTo(2);
+                assertThat(world.err()).contains("Не удалось прочитать файл").doesNotContain("Непредвиденная");
+            } finally {
+                Files.setPosixFilePermissions(file, java.nio.file.attribute.PosixFilePermissions.fromString("rw-r--r--"));
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("не войдя — «выполните вход», запрос не уходит")
+    void notLoggedIn() throws IOException {
+        Files.delete(world.credentials());
+        assertThat(world.run("submit", "MovCode0002")).isEqualTo(2);
+        assertThat(world.err()).contains("hammerhall login");
+        assertThat(platform.seen()).isEmpty();
     }
 }

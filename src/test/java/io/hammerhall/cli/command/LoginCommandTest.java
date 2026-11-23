@@ -1,265 +1,184 @@
 package io.hammerhall.cli.command;
 
-import com.sun.net.httpserver.HttpServer;
-import io.hammerhall.cli.CliException;
-import io.hammerhall.cli.Console;
+import io.hammerhall.cli.FakePlatform;
+import io.hammerhall.cli.Json;
+import io.hammerhall.cli.World;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.io.PrintStream;
-import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
-import java.util.concurrent.atomic.AtomicReference;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
+import static io.hammerhall.cli.FakePlatform.json;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Вход: обмен почты и пароля на ключ.
- *
- * <h3>Почему настоящий сервер, а не мок</h3>
- *
- * Здесь проверяется работа с HTTP: форма запроса, ОТСУТСТВИЕ заголовка
- * {@code Authorization}, перевод кодов отказа в слова. Мок {@code HttpClient}
- * проверял бы наши представления о нём. {@code com.sun.net.httpserver} встроен
- * в JDK — поднять настоящий сервер дешевле мока и честнее его.
- *
- * <h3>Что здесь охраняется</h3>
- *
- * <ul>
- *   <li><b>Имя поля в ответе.</b> {@code apiToken} — контракт платформы.
- *       Ошибись клиент в имени, {@code Json.string} вернул бы {@code null},
- *       и в конфиг уехала бы пустота. В проекте это уже случалось: профиль
- *       показывал нули при трёх решённых задачах;</li>
- *   <li><b>Анонимность запроса.</b> Ключа на этом шаге нет, и заголовка быть
- *       не должно;</li>
- *   <li><b>Слова отказа.</b> {@code 401} у этой ручки значит не то же самое,
- *       что у остальных. Совет «перевыпустите ключ» человеку, ошибшемуся
- *       паролем, отправляет его чинить исправное.</li>
- * </ul>
+ * Вход — сквозняком: строка, ввод, настоящий сервер, файл ключей, код возврата.
+ * До 0.2.0 вход по паролю был покрыт на 43 %, потому что команду нельзя
+ * было запустить целиком (ревью CLI №1, АРХ-2).
  */
-@DisplayName("LoginCommand — вход по почте и паролю")
+@DisplayName("login и logout")
 class LoginCommandTest {
 
-    private HttpServer server;
+    @TempDir
+    Path temp;
 
-    private final AtomicReference<String> seenAuthorization = new AtomicReference<>();
-    private final AtomicReference<String> seenBody = new AtomicReference<>();
-    private final AtomicReference<String> seenPath = new AtomicReference<>();
+    private FakePlatform platform;
+    private World world;
+
+    @BeforeEach
+    void setUp() throws IOException {
+        platform = new FakePlatform();
+        world = new World(temp).platform(platform);
+    }
 
     @AfterEach
-    void stopServer() {
-        if (server != null) {
-            server.stop(0);
-        }
+    void tearDown() {
+        platform.close();
     }
 
-    /** Команда с выводом в никуда: здесь проверяется не печать, а обмен. */
-    private LoginCommand command() {
-        PrintStream sink = new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8);
-        return new LoginCommand(new Console(sink, sink));
+    @Test
+    @DisplayName("почта и пароль → ключ сохранён в ~/.hammerhall/credentials → проверен")
+    void exchangesAndSaves() throws IOException {
+        platform.on("POST", "/auth/token", json(200, "{\"apiToken\":\"key-a1b2\"}"))
+                .on("GET", "/profile", json(200, "[]"));
+        world.terminal = true;
+        world.lines.add("  ученик@hammerhall.io ");
+        world.secrets.add("пароль-с-кириллицей");
+
+        assertThat(world.run("login")).isZero();
+
+        Json.Node body = Json.parse(platform.last("POST", "/auth/token").body());
+        assertThat(body.get("email").string()).isEqualTo("ученик@hammerhall.io");
+        assertThat(body.get("password").string()).isEqualTo("пароль-с-кириллицей");
+        assertThat(Files.readString(world.credentials())).contains(platform.url() + "=key-a1b2");
+        assertThat(platform.last("GET", "/profile").header("Authorization")).isEqualTo("Bearer key-a1b2");
+        assertThat(world.out()).contains("Почта: ").contains("Ключ получен и сохранён").doesNotContain("НЕ скрывается");
+        assertThat(world.prompts).containsExactly("Пароль: ");
     }
 
-    /** Поднимает сервер, отвечающий заданным кодом и телом на любой путь. */
-    private String serverReturning(int status, String body) throws IOException {
-        server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
-        server.createContext("/", exchange -> {
-            seenAuthorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
-            seenPath.set(exchange.getRequestURI().getPath());
-            seenBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
-
-            byte[] payload = body.getBytes(StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(status, payload.length == 0 ? -1 : payload.length);
-            try (OutputStream out = exchange.getResponseBody()) {
-                out.write(payload);
-            }
-        });
-        server.start();
-        return "http://localhost:" + server.getAddress().getPort();
+    @Test
+    @DisplayName("🔴 ВЫС-7: не терминал — ввод не скрыт, и человек об этом предупреждён")
+    void warnsWhenVisible() {
+        platform.on("POST", "/auth/token", json(200, "{\"apiToken\":\"key\"}")).on("GET", "/profile", json(200, "[]"));
+        world.terminal = false;
+        world.lines.add("a@b");
+        world.secrets.add("p");
+        assertThat(world.run("login")).isZero();
+        assertThat(world.out()).contains("НЕ скрывается");
     }
 
-    @Nested
-    @DisplayName("обмен почты и пароля на ключ")
-    class Exchange {
+    @Test
+    @DisplayName("🔴 ВЫС-8: /profile отказал — ключ всё равно СОХРАНЁН, а не потерян; только предупреждение")
+    void savesBeforeVerifying() throws IOException {
+        platform.on("POST", "/auth/token", json(200, "{\"apiToken\":\"fresh-key\"}"))
+                .on("GET", "/profile", json(401, "{}"));
+        world.lines.add("a@b");
+        world.secrets.add("p");
 
-        @Test
-        @DisplayName("успех — ключ берётся из поля apiToken")
-        void returnsKeyFromResponse() throws IOException {
-            String api = serverReturning(200, "{\"apiToken\":\"a1b2c3d4e5f6\"}");
+        assertThat(world.run("login")).isZero();
 
-            String key = command().login(api, "user@example.com", "верный-пароль");
-
-            assertThat(key).isEqualTo("a1b2c3d4e5f6");
-            assertThat(seenPath.get()).isEqualTo("/auth/token");
-        }
-
-        @Test
-        @DisplayName("🔴 запрос уходит БЕЗ заголовка Authorization — ключа ещё нет")
-        void sendsNoAuthorizationHeader() throws IOException {
-            String api = serverReturning(200, "{\"apiToken\":\"a1b2c3d4e5f6\"}");
-
-            command().login(api, "user@example.com", "пароль");
-
-            assertThat(seenAuthorization.get()).isNull();
-        }
-
-        @Test
-        @DisplayName("почта и пароль уезжают в теле, пароль — как ввели")
-        void sendsCredentialsInBody() throws IOException {
-            String api = serverReturning(200, "{\"apiToken\":\"a1b2c3d4e5f6\"}");
-
-            // ⚠️ Пароль по-русски намеренно: он едет в ТЕЛЕ, в UTF-8, и правило
-            // «только ASCII» к нему не относится — оно про заголовок. Запрети
-            // клиент кириллицу в пароле, он отверг бы пароль, который платформа
-            // приняла бы.
-            command().login(api, "user@example.com", "пароль с пробелом");
-
-            assertThat(seenBody.get())
-                    .contains("\"email\":\"user@example.com\"")
-                    .contains("\"password\":\"пароль с пробелом\"");
-        }
-
-        @Test
-        @DisplayName("пустая почта или пароль — отказ ДО запроса")
-        void refusesEmptyCredentials() throws IOException {
-            String api = serverReturning(200, "{\"apiToken\":\"a1b2c3d4e5f6\"}");
-
-            assertThatThrownBy(() -> command().login(api, "  ", "пароль"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("Почта не введена");
-            assertThatThrownBy(() -> command().login(api, "user@example.com", ""))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("Пароль не введён");
-
-            // Положительный контроль к обоим утверждениям: сервер не видел
-            // запроса вовсе. Без этой строки «отказ до запроса» было бы
-            // истинно и в случае, когда запрос ушёл, а отказ пришёл оттуда.
-            assertThat(seenPath.get()).isNull();
-        }
+        assertThat(Files.readString(world.credentials())).contains("fresh-key");
+        assertThat(world.out()).contains("Ключ сохранён, но платформа его пока не приняла");
     }
 
-    @Nested
-    @DisplayName("отказы платформы объясняются словами ЭТОЙ ручки")
-    class Refusals {
-
-        @Test
-        @DisplayName("🔴 401 — «почта или пароль», а НЕ «перевыпустите ключ»")
-        void explainsWrongPassword() throws IOException {
-            String api = serverReturning(401, "");
-
-            assertThatThrownBy(() -> command().login(api, "user@example.com", "не тот"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("Не подошли почта или пароль")
-                    // Умолчание из ApiClient сюда доехать не должно:
-                    // перевыпускать нечего, ключа у человека ещё нет.
-                    .hasMessageNotContaining("Перевыпустите");
-        }
-
-        @Test
-        @DisplayName("403 — почта не подтверждена")
-        void explainsUnverifiedEmail() throws IOException {
-            String api = serverReturning(403, "");
-
-            assertThatThrownBy(() -> command().login(api, "user@example.com", "пароль"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("Почта не подтверждена");
-        }
-
-        @Test
-        @DisplayName("429 остаётся умолчанием — своих слов про частоту у команды нет")
-        void keepsRateLimitMessage() throws IOException {
-            String api = serverReturning(429, "");
-
-            assertThatThrownBy(() -> command().login(api, "user@example.com", "пароль"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("Слишком часто");
-        }
+    @Test
+    @DisplayName("проверка упала по сети — тоже предупреждение, ключ на месте")
+    void verifyNetworkFailure() throws IOException {
+        platform.on("POST", "/auth/token", json(200, "{\"apiToken\":\"fresh-key\"}"))
+                .on("GET", "/profile", json(500, "{\"message\":\"сбой\\nвторая строка\"}"));
+        world.lines.add("a@b");
+        world.secrets.add("p");
+        assertThat(world.run("login")).isZero();
+        assertThat(world.out()).contains("Проверить ключ сейчас не удалось").doesNotContain("вторая строка");
+        assertThat(Files.readString(world.credentials())).contains("fresh-key");
     }
 
-    @Nested
-    @DisplayName("разбор ответа")
-    class Parsing {
-
-        @Test
-        @DisplayName("ключ достаётся по имени поля из контракта платформы")
-        void readsApiTokenField() {
-            assertThat(LoginCommand.extractKey("{\"apiToken\":\"a1b2c3\"}")).isEqualTo("a1b2c3");
+    @Test
+    @DisplayName("401 на входе — «почта или пароль», а не «перевыпустите ключ»; 403 — «подтвердите почту»")
+    void refusals() {
+        platform.on("POST", "/auth/token", json(401, "{}"), json(403, "{}"), json(500, "{}"));
+        for (String expected : new String[]{"Не подошли почта или пароль", "Почта не подтверждена", "500"}) {
+            world.clear();
+            world.lines.add("a@b");
+            world.secrets.add("p");
+            assertThat(world.run("login")).isEqualTo(expected.equals("500") ? 3 : 2);
+            assertThat(world.err()).contains(expected).doesNotContain("перевыпустите");
         }
-
-        @Test
-        @DisplayName("🔴 поля нет — внятный отказ, а не пустой ключ в конфиге")
-        void refusesResponseWithoutKey() {
-            // Так выглядело бы переименование поля на платформе: Json.string
-            // вернёт null, и без этой проверки в конфиг уехала бы пустота.
-            assertThatThrownBy(() -> LoginCommand.extractKey("{\"token\":\"a1b2c3\"}"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("ключа в ответе нет");
-            assertThatThrownBy(() -> LoginCommand.extractKey("{\"apiToken\":\"\"}"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("ключа в ответе нет");
-        }
-
-        @Test
-        @DisplayName("ключ с непечатаемым — фраза, а не стектрейс из HttpClient")
-        void refusesNonAsciiKey() {
-            assertThatThrownBy(() -> LoginCommand.extractKey("{\"apiToken\":\"ключ\"}"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("неожиданном виде");
-        }
+        assertThat(world.credentials()).doesNotExist();
     }
 
-    @Nested
-    @DisplayName("вставленный ключ — что принимаем, что отбиваем")
-    class Pasted {
+    @Test
+    @DisplayName("ответ без ключа или с мусором — не тишина в файл, а ошибка")
+    void badKeys() {
+        assertThatThrownBy(() -> LoginCommand.extractKey(Json.parse("{\"token\":\"x\"}")))
+                .hasMessageContaining("ключа в ответе нет");
+        assertThatThrownBy(() -> LoginCommand.extractKey(Json.parse("{\"apiToken\":\"ключ\"}")))
+                .hasMessageContaining("неожиданном виде");
+        assertThat(LoginCommand.extractKey(Json.parse("{\"apiToken\":\" abc \"}"))).isEqualTo("abc");
+    }
 
-        @Test
-        @DisplayName("пробелы по краям обрезаются молча")
-        void trimsSurroundingSpaces() {
-            // Частый результат копирования из браузера: выделилось с запасом.
-            assertThat(LoginCommand.normalize("  a1b2c3d4  ")).isEqualTo("a1b2c3d4");
-            assertThat(LoginCommand.normalize("\ta1b2c3d4\n")).isEqualTo("a1b2c3d4");
-        }
+    @Test
+    @DisplayName("пустая почта, пустой пароль — запрос не уходит")
+    void emptyInput() {
+        world.lines.add(" ");
+        assertThat(world.run("login")).isEqualTo(2);
+        assertThat(world.err()).contains("Почта не введена");
+        world.lines.add("a@b");
+        assertThat(world.run("login")).isEqualTo(2);
+        assertThat(world.err()).contains("Пароль не введён");
+        assertThat(platform.seen()).isEmpty();
+    }
 
-        @Test
-        @DisplayName("обычный ключ проходит как есть")
-        void acceptsHexToken() {
-            String token = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    @Test
+    @DisplayName("--token — вставить ключ из кабинета; мусор — понятная ошибка")
+    void pastedKey() throws IOException {
+        platform.on("GET", "/profile", json(200, "[]"));
+        world.secrets.add("  pasted-key-9  ");
+        assertThat(world.run("login", "--token")).isZero();
+        assertThat(Files.readString(world.credentials())).contains("=pasted-key-9");
 
-            assertThat(LoginCommand.normalize(token)).isEqualTo(token);
-        }
+        world.secrets.add("ключ кириллицей");
+        assertThat(world.run("login", "--token")).isEqualTo(2);
+        assertThat(world.err()).contains("Ключ выглядит неправильно");
+        world.secrets.add("   ");
+        assertThat(world.run("login", "--token")).isEqualTo(2);
+        assertThat(world.err()).contains("Пустой ключ");
+    }
 
-        @Test
-        @DisplayName("пусто — внятный отказ, а не попытка сохранить пустоту")
-        void rejectsBlank() {
-            assertThatThrownBy(() -> LoginCommand.normalize(""))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("Пустой ключ");
-            assertThatThrownBy(() -> LoginCommand.normalize("   "))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("Пустой ключ");
-            assertThatThrownBy(() -> LoginCommand.normalize(null))
-                    .isInstanceOf(CliException.class);
-        }
+    @Test
+    @DisplayName("ключ аргументом — отказ: он остался бы в истории терминала")
+    void keyAsArgumentRejected() {
+        assertThat(world.run("login", "abc123")).isEqualTo(2);
+        assertThat(world.err()).contains("аргументом не принимается");
+    }
 
-        @Test
-        @DisplayName("🔴 кириллица отбивается СЛОВАМИ, а не стектрейсом из HttpClient")
-        void rejectsNonAscii() {
-            assertThatThrownBy(() -> LoginCommand.normalize("мой-секретный-ключ"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("выглядит неправильно");
-        }
+    @Test
+    @DisplayName("🔑 вход работает и вне кузницы: ключ теперь один на машину (АРХ-3)")
+    void outsideForge() throws IOException {
+        platform.on("POST", "/auth/token", json(200, "{\"apiToken\":\"k\"}")).on("GET", "/profile", json(200, "[]"));
+        world.workDir = Files.createDirectories(world.home.resolve("anywhere"));
+        world.lines.add("a@b");
+        world.secrets.add("p");
+        assertThat(world.run("login")).isZero();
+    }
 
-        @Test
-        @DisplayName("🔴 ключ с пробелом внутри — тоже отказ: заголовок такого не переживёт")
-        void rejectsInnerWhitespace() {
-            assertThatThrownBy(() -> LoginCommand.normalize("a1b2 c3d4"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("выглядит неправильно");
-        }
+    @Test
+    @DisplayName("logout — ключ удалён с машины, и сказано, что на платформе он ещё действует")
+    void logout() throws IOException {
+        world.loggedIn(platform, "k1");
+        assertThat(world.run("logout")).isZero();
+        assertThat(world.out()).contains("Ключ удалён").contains("остаётся действующим");
+        assertThat(Files.readString(world.credentials())).doesNotContain("k1");
+
+        world.clear();
+        assertThat(world.run("logout")).isZero();
+        assertThat(world.out()).contains("и так не выполнен");
+        assertThat(world.run("logout", "лишнее")).isEqualTo(2);
     }
 }

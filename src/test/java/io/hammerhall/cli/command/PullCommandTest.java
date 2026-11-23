@@ -1,334 +1,154 @@
 package io.hammerhall.cli.command;
 
-import io.hammerhall.cli.CliException;
-import io.hammerhall.cli.Console;
+import io.hammerhall.cli.FakePlatform;
+import io.hammerhall.cli.Json;
+import io.hammerhall.cli.World;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.PrintStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static io.hammerhall.cli.FakePlatform.json;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/**
- * Первые тесты пакета команд — до 23.07 он был покрыт на ноль.
- *
- * <h3>Что здесь охраняется</h3>
- *
- * {@code pull} — единственная команда клиента, которая <b>пишет</b> в проект
- * человека. Ошибка тут не «неудобно», а «потеряна неделя работы»: не тот
- * путь — файл уедет мимо пакета, нет защиты — затрёт готовое решение,
- * доверие к серверу — запись уйдёт за пределы кузницы.
- *
- * <p>Сеть здесь не нужна: проверяются чистые решения о пути и записи.
- * Разговор с платформой покрыт в {@code ApiClientTest}.
- */
-@DisplayName("PullCommand — куда кладём задачу и что не затираем")
+@DisplayName("pull — задача из кузницы в проект")
 class PullCommandTest {
 
     private static final String SOURCE = """
-            package io.hammerhall.streamforge.task.code.level01.easy.part01.ore.mov;
+            package io.hammerhall.forge.stream.movie;
 
+            /** Задача. Слово package в комментарии ниже не путает разбор. */
             public class MovCode0002 {
-                // package io.чужой.пакет; — это комментарий, а не объявление
             }
             """;
 
-    @Nested
-    @DisplayName("идентификатор задачи")
-    class TaskId {
+    @TempDir
+    Path temp;
 
-        @Test
-        @DisplayName("принимаем и с .java, и без")
-        void acceptsBothForms() {
-            assertThat(PullCommand.taskIdOf("MovCode0002")).isEqualTo("MovCode0002");
-            assertThat(PullCommand.taskIdOf("MovCode0002.java")).isEqualTo("MovCode0002");
-        }
+    private FakePlatform platform;
+    private World world;
 
-        @Test
-        @DisplayName("🔴 path traversal отвергается до сети и до диска")
-        void rejectsTraversal() {
-            // Идентификатор уезжает и в URL, и в имя файла. Пропустить такое
-            // значит дать записать файл куда угодно.
-            assertThatThrownBy(() -> PullCommand.taskIdOf("../../etc/passwd"))
-                    .isInstanceOf(CliException.class);
-            assertThatThrownBy(() -> PullCommand.taskIdOf("Mov/Code"))
-                    .isInstanceOf(CliException.class);
-            assertThatThrownBy(() -> PullCommand.taskIdOf(""))
-                    .isInstanceOf(CliException.class);
-        }
+    @BeforeEach
+    void setUp() throws IOException {
+        platform = new FakePlatform();
+        world = new World(temp).loggedIn(platform, "k");
     }
 
-    @Nested
-    @DisplayName("пакет из текста задачи")
-    class PackageParsing {
-
-        @Test
-        @DisplayName("объявление пакета читается")
-        void readsPackage() {
-            assertThat(PullCommand.packageOf(SOURCE))
-                    .isEqualTo("io.hammerhall.streamforge.task.code.level01.easy.part01.ore.mov");
-        }
-
-        @Test
-        @DisplayName("🔴 слово package в комментарии НИЖЕ объявлением не считается")
-        void ignoresPackageWordInComments() {
-            // Сканирование останавливается на первом объявлении типа: дальше
-            // объявления пакета быть не может, а слово в комментарии — запросто.
-            assertThat(PullCommand.packageOf(SOURCE))
-                    .doesNotContain("чужой");
-        }
-
-        @Test
-        @DisplayName("пакета нет — null, а не выдуманное значение")
-        void noPackageIsNull() {
-            assertThat(PullCommand.packageOf("public class A {}")).isNull();
-            assertThat(PullCommand.packageOf("import java.util.List;\npublic class A {}")).isNull();
-        }
-
-        @Test
-        @DisplayName("сканирование останавливается на ЛЮБОМ объявлении типа")
-        void stopsAtEveryDeclarationKeyword() {
-            // Четыре слова-ограничителя в коде, а проверялись два. Каждое
-            // означает «дальше объявления пакета быть не может»; пропусти
-            // клиент одно — он продолжил бы читать тело класса и мог бы
-            // принять за пакет слово из строкового литерала.
-            assertThat(PullCommand.packageOf("class A {}")).isNull();
-            assertThat(PullCommand.packageOf("final class A {}")).isNull();
-            assertThat(PullCommand.packageOf("abstract class A {}")).isNull();
-        }
-
-        @Test
-        @DisplayName("🔑 объявление НИЖЕ ограничителя не подхватывается")
-        void ignoresPackageAfterDeclaration() {
-            // Положительный контроль к предыдущему тесту: он проверяет, что
-            // вернулся null, а этот — что null вернулся ИМЕННО из-за
-            // остановки, а не потому что метод не нашёл бы пакет и так.
-            assertThat(PullCommand.packageOf("class A {}\npackage io.чужой;")).isNull();
-            assertThat(PullCommand.packageOf("package io.свой;\nclass A {}")).isEqualTo("io.свой");
-        }
+    @AfterEach
+    void tearDown() {
+        platform.close();
     }
 
-    @Nested
-    @DisplayName("путь файла")
-    class TargetPath {
-
-        @Test
-        @DisplayName("пакет разворачивается в дерево каталогов под src/main/java")
-        void buildsPathFromPackage(@TempDir Path root) {
-            Path target = PullCommand.targetPath(root, SOURCE, "MovCode0002");
-
-            assertThat(root.relativize(target).toString().replace('\\', '/'))
-                    .isEqualTo("src/main/java/io/hammerhall/streamforge/task/code/"
-                            + "level01/easy/part01/ore/mov/MovCode0002.java");
-        }
-
-        @Test
-        @DisplayName("без пакета — корень исходников, а не падение")
-        void fallsBackToSourceRoot(@TempDir Path root) {
-            Path target = PullCommand.targetPath(root, "public class A {}", "MovCode0002");
-
-            assertThat(root.relativize(target).toString().replace('\\', '/'))
-                    .isEqualTo("src/main/java/MovCode0002.java");
-        }
-
-        @Test
-        @DisplayName("🔴 испорченный пакет с сервера не уводит запись за пределы кузницы")
-        void rejectsBrokenPackage(@TempDir Path root) {
-            // Слэши и «..» — настоящая попытка выйти из дерева исходников.
-            assertThatThrownBy(() -> PullCommand.targetPath(
-                    root, "package io/../../etc;\npublic class A {}", "MovCode0002"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("пакет");
-
-            // Пустая часть — тоже поломка. Java при split МОЛЧА отбрасывает
-            // пустые хвосты, и без -1 «io...» стал бы невинным «io»: файл
-            // уехал бы не в тот каталог, а человек не понял бы почему.
-            assertThatThrownBy(() -> PullCommand.targetPath(
-                    root, "package io...;\npublic class A {}", "MovCode0002"))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("пакет");
-        }
+    private String card(String id) {
+        return Json.object("id", id, "source", SOURCE, "displayName", "Первый фильм", "stage", "Easy", "leadAxis", "SEQ");
     }
 
-    @Nested
-    @DisplayName("запись")
-    class Writing {
-
-        @Test
-        @DisplayName("каталоги пакета создаются, текст пишется в UTF-8")
-        void createsDirectoriesAndWrites(@TempDir Path root) throws IOException {
-            Path target = root.resolve("src/main/java/io/mov/MovCode0002.java");
-
-            PullCommand.write(target, SOURCE, false);
-
-            assertThat(Files.readString(target, StandardCharsets.UTF_8)).isEqualTo(SOURCE);
-        }
-
-        @Test
-        @DisplayName("🔴 существующий файл НЕ затирается — там может лежать решение")
-        void refusesToOverwrite(@TempDir Path root) throws IOException {
-            Path target = root.resolve("MovCode0002.java");
-            Files.writeString(target, "моё решение, которое я писал неделю");
-
-            assertThatThrownBy(() -> PullCommand.write(target, SOURCE, false))
-                    .isInstanceOf(CliException.class)
-                    .hasMessageContaining("--force");
-
-            assertThat(Files.readString(target)).startsWith("моё решение");
-        }
-
-        @Test
-        @DisplayName("--force затирает осознанно")
-        void forceOverwrites(@TempDir Path root) throws IOException {
-            Path target = root.resolve("MovCode0002.java");
-            Files.writeString(target, "старое");
-
-            assertThatCode(() -> PullCommand.write(target, SOURCE, true))
-                    .doesNotThrowAnyException();
-
-            assertThat(Files.readString(target)).isEqualTo(SOURCE);
-        }
+    private Path target() {
+        return world.forge.resolve("src/main/java/io/hammerhall/forge/stream/movie/MovCode0002.java");
     }
 
-    /**
-     * Что человек видит после успешного {@code pull}.
-     *
-     * <h3>Почему это не «просто печать»</h3>
-     *
-     * Здесь разбирается ответ платформы: {@code displayName}, {@code stage},
-     * {@code leadAxis}. Все три необязательны, и каждое отсутствующее меняет
-     * форму строки. Собрать «ступень 3 · ведущая ось Композиция» из того,
-     * чего нет, — дело одной забытой проверки: разделитель повиснет
-     * в воздухе, а отсутствующее поле напечатается словом {@code null}.
-     *
-     * <p>🔑 Тот же довод, по которому покрыт {@code ProfileCommand.print}:
-     * клиент вырезает поля по именам, платформа их переименовывает
-     * молча, и расхождение не даёт ни ошибки, ни отказа — только
-     * обеднённый вывод, который никто не заметит.
-     */
-    @Nested
-    @DisplayName("что показываем после того, как забрали")
-    class Report {
+    @Test
+    @DisplayName("кладёт файл в пакет из текста задачи и говорит, что дальше")
+    void pulls() throws IOException {
+        platform.on("GET", "/tasks/stream-forge/MovCode0002", json(200, card("MovCode0002")));
+        assertThat(world.run("pull", "MovCode0002.java")).isZero();
+        assertThat(Files.readString(target())).isEqualTo(SOURCE);
+        assertThat(world.out()).contains("MovCode0002 — Первый фильм").contains("ступень Easy · ведущая ось SEQ")
+                .contains("hammerhall submit MovCode0002.java");
+    }
 
-        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
-        private final ByteArrayOutputStream err = new ByteArrayOutputStream();
+    @Test
+    @DisplayName("🔴 СР-5: набрали movcode0002 — файл называется как задача у платформы, а не как набрали")
+    void canonicalName() {
+        platform.on("GET", "/tasks/stream-forge/movcode0002", json(200, card("MovCode0002")));
+        assertThat(world.run("pull", "movcode0002")).isZero();
+        assertThat(target()).exists();
+    }
 
-        private final PullCommand command = new PullCommand(new Console(
-                new PrintStream(out, true, StandardCharsets.UTF_8),
-                new PrintStream(err, true, StandardCharsets.UTF_8)));
+    @Test
+    @DisplayName("🔴 СР-4: флаг до номера — работает; файл есть — без --force отказ, решение не тронуто")
+    void forceAnywhereAndRefusal() throws IOException {
+        platform.on("GET", "/tasks/stream-forge/MovCode0002", json(200, card("MovCode0002")));
+        Files.createDirectories(target().getParent());
+        Files.writeString(target(), "моё решение за неделю");
 
-        /** Вывод без управляющих последовательностей цвета. */
-        private String printed() {
-            return (out.toString(StandardCharsets.UTF_8) + err.toString(StandardCharsets.UTF_8))
-                    .replaceAll("\u001B\\[[0-9;]*m", "");
-        }
+        assertThat(world.run("pull", "MovCode0002")).isEqualTo(2);
+        assertThat(world.err()).contains("Файл уже есть").contains("--force");
+        assertThat(Files.readString(target())).isEqualTo("моё решение за неделю");
 
-        private Path path() {
-            return Path.of("src/main/java/io/hammerhall/task/MovCode0002.java");
-        }
+        assertThat(world.run("pull", "--force", "MovCode0002")).isZero();
+        assertThat(Files.readString(target())).isEqualTo(SOURCE);
+    }
 
-        @Test
-        @DisplayName("всё на месте — название, путь, ступень с осью и подсказка")
-        void printsEverything() {
-            command.report("""
-                    {"displayName":"Фильмы одного года","stage":"3",
-                     "leadAxis":"Композиция","source":"class A {}"}""",
-                    "MovCode0002", path());
+    @Test
+    @DisplayName("🔴 СР-6: --force откладывает прежний файл в .bak — и не затирает прежние .bak")
+    void forceKeepsBackup() throws IOException {
+        platform.on("GET", "/tasks/stream-forge/MovCode0002", json(200, card("MovCode0002")));
+        Files.createDirectories(target().getParent());
+        Files.writeString(target(), "версия 1");
+        assertThat(world.run("pull", "MovCode0002", "--force")).isZero();
+        Files.writeString(target(), "версия 2");
+        assertThat(world.run("pull", "MovCode0002", "--force")).isZero();
 
-            assertThat(printed())
-                    .contains("MovCode0002 — Фильмы одного года")
-                    .contains("MovCode0002.java")
-                    .contains("ступень 3")
-                    .contains("ведущая ось Композиция")
-                    .contains("·")
-                    .contains("hammerhall submit MovCode0002.java");
-        }
+        assertThat(Files.readString(target().resolveSibling("MovCode0002.java.bak"))).isEqualTo("версия 1");
+        assertThat(Files.readString(target().resolveSibling("MovCode0002.java.bak.1"))).isEqualTo("версия 2");
+        assertThat(world.out()).contains("Прежний файл отложен");
+    }
 
-        @Test
-        @DisplayName("🔴 названия нет — печатаем номер, а не слово null")
-        void survivesMissingName() {
-            command.report("""
-                    {"stage":"3","source":"class A {}"}""", "MovCode0002", path());
+    @Test
+    @DisplayName("🔑 квота выдачи: 429 — текст платформы как есть, код 2")
+    void quota() {
+        platform.on("GET", "/tasks/stream-forge/MovCode0009", json(429,
+                "{\"message\":\"За час можно взять 2 новые задачи — следующая через 37 мин.\",\"reason\":\"hour\"}",
+                "Retry-After", "2220"));
+        assertThat(world.run("pull", "MovCode0009")).isEqualTo(2);
+        assertThat(world.err()).contains("следующая через 37 мин");
+        assertThat(world.sleeps).isEmpty();
+    }
 
-            assertThat(printed())
-                    .contains("MovCode0002")
-                    .doesNotContain("null")
-                    // Тире появляется только вместе с названием: без этой
-                    // проверки строка «MovCode0002 — » выглядела бы успехом.
-                    .doesNotContain("MovCode0002 —");
-        }
+    @Test
+    @DisplayName("текста нет, пакет испорчен, номер негодный, вне кузницы — понятные отказы")
+    void refusals() throws IOException {
+        platform.on("GET", "/tasks/stream-forge/MovCode0003", json(200, "{\"id\":\"MovCode0003\"}"))
+                .on("GET", "/tasks/stream-forge/MovCode0004",
+                        json(200, Json.object("id", "MovCode0004", "source", "package io..evil;\nclass MovCode0004 {}")));
+        assertThat(world.run("pull", "MovCode0003")).isEqualTo(2);
+        assertThat(world.err()).contains("ещё не выложен");
+        assertThat(world.run("pull", "MovCode0004")).isEqualTo(2);
+        assertThat(world.err()).contains("Испорченный пакет");
+        assertThat(world.run("pull", "../../etc/passwd")).isEqualTo(2);
+        assertThat(world.err()).contains("не похоже на номер задачи");
+        assertThat(world.run("pull")).isEqualTo(2);
+        assertThat(world.err()).contains("hammerhall pull MovCode0002");
 
-        @Test
-        @DisplayName("🔴 только ступень — без разделителя, повисшего в воздухе")
-        void printsStageAlone() {
-            command.report("""
-                    {"displayName":"Фильмы","stage":"3","source":"class A {}"}""",
-                    "MovCode0002", path());
+        world.workDir = Files.createDirectories(world.home.resolve("elsewhere"));
+        assertThat(world.run("pull", "MovCode0002")).isEqualTo(2);
+        assertThat(world.err()).contains("не похоже на кузницу");
+    }
 
-            assertThat(printed())
-                    .contains("ступень 3")
-                    .doesNotContain("·")
-                    .doesNotContain("ведущая ось");
-        }
+    @Test
+    @DisplayName("без пакета — в корень исходников; карточка без названия — номер без висящего разделителя")
+    void noPackageNoName() throws IOException {
+        platform.on("GET", "/tasks/stream-forge/MovCode0005",
+                json(200, Json.object("source", "void main() {\n}\n")));
+        assertThat(world.run("pull", "MovCode0005")).isZero();
+        assertThat(world.forge.resolve("src/main/java/MovCode0005.java")).exists();
+        assertThat(world.out()).contains("MovCode0005").doesNotContain("—  ").doesNotContain("null");
+    }
 
-        @Test
-        @DisplayName("только ведущая ось — тоже без разделителя")
-        void printsAxisAlone() {
-            command.report("""
-                    {"displayName":"Фильмы","leadAxis":"Композиция","source":"class A {}"}""",
-                    "MovCode0002", path());
-
-            assertThat(printed())
-                    .contains("ведущая ось Композиция")
-                    .doesNotContain("·")
-                    .doesNotContain("ступень");
-        }
-
-        @Test
-        @DisplayName("ни ступени, ни оси — строки описания нет вовсе")
-        void omitsDescriptionEntirely() {
-            command.report("""
-                    {"displayName":"Фильмы","source":"class A {}"}""",
-                    "MovCode0002", path());
-
-            assertThat(printed())
-                    .contains("MovCode0002 — Фильмы")
-                    .doesNotContain("ступень")
-                    .doesNotContain("ведущая ось")
-                    .doesNotContain("·");
-        }
-
-        @Test
-        @DisplayName("🔑 подсказка про submit есть всегда — это следующий шаг человека")
-        void alwaysTellsWhatToDoNext() {
-            // Ответ пустой настолько, насколько это возможно: даже тогда
-            // человек обязан узнать, чем продолжить.
-            command.report("{}", "WldCode0007", path());
-
-            assertThat(printed()).contains("hammerhall submit WldCode0007.java");
-        }
-
-        @Test
-        @DisplayName("пустые строки в полях считаются отсутствием, а не значением")
-        void treatsBlankAsMissing() {
-            command.report("""
-                    {"displayName":"  ","stage":"","leadAxis":"  ","source":"class A {}"}""",
-                    "MovCode0002", path());
-
-            assertThat(printed())
-                    .contains("MovCode0002")
-                    .doesNotContain("—")
-                    .doesNotContain("ступень")
-                    .doesNotContain("ведущая ось");
-        }
+    @Test
+    @DisplayName("разбор пакета: до первого объявления; package в комментарии ниже — не пакет")
+    void packageParsing() {
+        assertThat(PullCommand.packageOf("package a.b;\nclass X {}")).isEqualTo("a.b");
+        assertThat(PullCommand.packageOf("import x.Y;\n// package fake;\n")).isNull();
+        assertThat(PullCommand.packageOf("record R() {}\npackage late;")).isNull();
+        assertThatThrownBy(() -> PullCommand.targetPath(world.forge, "package a/b;", "X"))
+                .hasMessageContaining("Испорченный пакет");
     }
 }

@@ -7,7 +7,7 @@
 
     <groupId>io.hammerhall</groupId>
     <artifactId>hammerhall-cli</artifactId>
-    <version>0.1.4</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
 
     <name>Hammerhall CLI</name>
@@ -52,7 +52,7 @@
     </dependencyManagement>
 
     <dependencies>
-        <!-- Только для тестов. В cli-0.1.4.jar не едет. -->
+        <!-- Только для тестов. В jar клиента не едет. -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -112,8 +112,12 @@
             <!--
                 Покрытие: target/site/jacoco/index.html после `mvn test`.
                 Версия как на платформе — старые JaCoCo спотыкаются об
-                инструментирование байткода новых JDK. Порог не включён:
-                сначала набираем покрытие, потом фиксируем планку.
+                инструментирование байткода новых JDK.
+
+                🔑 Порог включён в 0.2.0 (ревью CLI №1, раздел 5): покрытие
+                строк не ниже 90 %, ветвей — не ниже 80 % (достигнуто 95 и 88).
+                Планка ниже достигнутого с запасом на мелкие правки; поднимать —
+                вместе с покрытием, опускать — только с объяснением в коммите.
             -->
             <plugin>
                 <groupId>org.jacoco</groupId>
@@ -133,6 +137,62 @@
                             <goal>report</goal>
                         </goals>
                     </execution>
+                    <execution>
+                        <id>check</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.90</minimum>
+                                        </limit>
+                                        <limit>
+                                            <counter>BRANCH</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.80</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+                Ревью CLI №1, раздел 5: на платформе уже ловили «Maven поехал
+                на JDK 18, а не 25». Пять строк здесь отменяют весь класс
+                таких расследований: не та Java или не тот Maven — сборка
+                останавливается сразу и говорит почему.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.6.1</version>
+                <executions>
+                    <execution>
+                        <id>enforce-toolchain</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireJavaVersion>
+                                    <version>[25,)</version>
+                                </requireJavaVersion>
+                                <requireMavenVersion>
+                                    <version>[3.9,)</version>
+                                </requireMavenVersion>
+                            </rules>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
 
@@ -144,6 +204,13 @@
                     <archive>
                         <manifest>
                             <mainClass>io.hammerhall.cli.Main</mainClass>
+                            <!--
+                                Implementation-Version в манифесте — отсюда
+                                клиент знает свою версию: команда version
+                                и заголовок User-Agent (ревью CLI №1, БЛОК-2).
+                                Без этой строки читать версию было неоткуда.
+                            -->
+                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
                         </manifest>
                     </archive>
                 </configuration>

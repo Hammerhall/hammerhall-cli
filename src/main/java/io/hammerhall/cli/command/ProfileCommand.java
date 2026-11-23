@@ -1,216 +1,139 @@
 package io.hammerhall.cli.command;
 
 import io.hammerhall.cli.ApiClient;
-import io.hammerhall.cli.Config;
+import io.hammerhall.cli.Args;
 import io.hammerhall.cli.Console;
+import io.hammerhall.cli.Context;
 import io.hammerhall.cli.ForgeRoot;
+import io.hammerhall.cli.Ids;
 import io.hammerhall.cli.Json;
+import io.hammerhall.cli.Msg;
 
-import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Показать профиль по осям.
+ * Показать профиль: в кузнице — по осям, вне кузницы — список кузниц.
  *
  * <h3>Клиент ничего не считает</h3>
  *
- * Ни одной формулы здесь нет и быть не должно. Сервер присылает готовые
- * числа, клиент рисует полоски. Поменяются веса, порог фундамента или
- * способ свёртки — обновлять программу у всех не придётся.
+ * Сервер присылает готовые числа, клиент рисует полоски. Поменяются веса,
+ * порог фундамента или способ свёртки — обновлять программу у всех
+ * не придётся.
  *
- * <p>Даже подпись «SEQ 3→4» после решения задачи формирует
- * {@code ProfileFormatter} на сервере.
+ * <h3>🔴 Потолок полоски — с сервера (0.2.0)</h3>
  *
- * <h3>Профиль отдельный на каждую кузницу</h3>
+ * До 0.2.0 здесь была зашита константа 12.5 — в классе, который начинался
+ * словами «клиент ничего не считает». Это константа СТАНДАРТА КУЗНИЦЫ:
+ * она поедет с ростом корпуса и у другой кузницы будет своя (ревью CLI №1,
+ * СР-1). Теперь длина полоски — {@code fill} оси (0..1), если сервер его
+ * прислал, иначе {@code score / maxScore} оси, иначе {@code axisMax}
+ * профиля. Пока платформа их не отдаёт — запасное 12.5, и оно здесь
+ * только до правки сервера (PR платформы следом за 0.2.0).
  *
- * Оси Stream Forge (SET, PAIR, SEQ, CTX, JOIN, ALGO, SYS, PERF) не имеют
- * смысла в реактивной кузнице — там будут свои. Складывать их в один
- * вектор нельзя, поэтому кузница указывается явно.
+ * <p>Числа — в {@link java.util.Locale#ROOT} (СР-3): «4.5», а не «4,5»;
+ * фундамент меньше процента — «&lt;1%», а не честный, но лживый «0%».
  */
-public class ProfileCommand {
+public final class ProfileCommand implements Command {
 
     /** Ширина полоски. Восемь осей должны помещаться в узкий терминал. */
     private static final int BAR_WIDTH = 20;
 
-    /** Потолок оси по стандарту кузницы — от него считается длина полоски. */
-    private static final double MAX_SCORE = 12.5;
+    /** Запасной потолок оси — пока платформа не присылает свой. */
+    static final double FALLBACK_AXIS_MAX = 12.5;
 
-    private final Console console;
-
-    public ProfileCommand(Console console) {
-        this.console = console;
+    @Override
+    public String name() {
+        return "profile";
     }
 
-    public int run(String[] args) {
-        Path root = ForgeRoot.find();
-        Config config = Config.load(root);
-        ApiClient api = new ApiClient(config.api(), config.token());
+    @Override
+    public int run(Args args, Context context) {
+        args.requireCount(0, 1, "hammerhall profile [кузница]");
+        String forgeId;
+        if (!args.rest().isEmpty()) {
+            forgeId = Ids.forge(args.rest().getFirst());
+        } else {
+            ForgeRoot.Found here = context.forgeOrNull();
+            forgeId = here == null ? null : here.id();
+        }
 
-        String forgeId = args.length > 0 ? args[0] : ForgeRoot.forgeId(root);
-        String response = api.get("/profile/" + forgeId);
-
-        print(forgeId, response);
+        try (ApiClient api = context.authorized()) {
+            if (forgeId == null) {
+                printForges(context.console(), api.get("profile").body());
+            } else {
+                print(context.console(), forgeId, api.get("profile", forgeId).body());
+            }
+        }
         return 0;
     }
 
-    /**
-     * Отрисовка ответа платформы. Пакетная видимость — ради теста: здесь
-     * живёт весь разбор JSON и всё форматирование, то есть ровно то, что
-     * ломается молча при смене формы ответа.
-     */
-    void print(String forgeId, String response) {
-        // ⚠️ Имена полей — КОНТРАКТ ПЛАТФОРМЫ, а не наши предпочтения:
-        // ProfileController.ProfileResponse отдаёт solvedTasks и points.
-        // Раньше здесь стояли tasksSolved и totalPoints — имена изнутри
-        // клиента, — и Json.number молча возвращал значения по умолчанию.
-        // Профиль показывал нули при трёх зачтённых задачах: ни ошибки,
-        // ни предупреждения, просто ноль. Сверять с сервером, не выдумывать.
-        long solved = Json.number(response, "solvedTasks", 0);
-        long points = Json.number(response, "points", 0);
+    /** Вне кузницы и без аргумента — список кузниц со сводкой (ответ — массив). */
+    static void printForges(Console console, Json.Node forges) {
+        List<Json.Node> items = forges.items();
+        console.print("");
+        if (items.isEmpty()) {
+            console.dim(Msg.t("profile.forges.none"));
+            return;
+        }
+        console.print(Msg.t("profile.forges.title"));
+        for (Json.Node forge : items) {
+            String name = forge.get("displayName").text();
+            console.print(Msg.t("profile.forges.row",
+                    forge.get("id").string(),
+                    name == null ? "" : name,
+                    forge.get("solvedTasks").asLong(0),
+                    forge.get("submissions").asLong(0)));
+        }
+        console.print("");
+        console.dim(Msg.t("profile.forges.hint"));
+    }
+
+    /** Профиль кузницы. Имена полей — контракт платформы ({@code ProfileResponse}). */
+    static void print(Console console, String forgeId, Json.Node profile) {
+        long solved = profile.get("solvedTasks").asLong(0);
+        long points = profile.get("points").asLong(0);
+        String forgeName = profile.get("forgeName").text();
 
         console.print("");
-        console.print("Кузница: " + forgeId);
-        console.print("Решено задач: %d   Очков: %d".formatted(solved, points));
+        console.print(Msg.t("profile.forge", forgeName == null ? forgeId : forgeName + " (" + forgeId + ")"));
+        console.print(Msg.t("profile.totals", solved, points));
         console.print("");
 
-        // Ответ платформы: {"axes":{"SEQ":{...},"JOIN":{...}}, ...}.
-        // Имена осей — ключи объекта axes, отдельного списка нет.
-        List<String> axes = axisNames(response);
-        if (axes.isEmpty()) {
-            // Пустой вектор — не ошибка, но причины у него две разные,
-            // и путать их нельзя.
-            if (solved > 0) {
-                // Задачи засчитаны, а осей нет: у слоя code разметки осей
-                // не бывает по устройству корпуса. Сказать «реши первую
-                // задачу» человеку, решившему три, — значит соврать ему
-                // в лицо и заставить искать несуществующую поломку.
-                console.dim("Засчитанные задачи не несут осей — вектор пока пуст.");
-            } else {
-                console.dim("Профиль пуст — решите первую задачу.");
-            }
+        Json.Node axes = profile.get("axes");
+        List<String> names = axes.keys();
+        if (names.isEmpty()) {
+            // Пустой вектор — не ошибка, но причины у него две, и путать их нельзя:
+            // у слоя code разметки осей нет по устройству корпуса, и человеку,
+            // решившему три задачи, «решите первую» было бы враньём.
+            console.dim(solved > 0 ? Msg.t("profile.empty.code") : Msg.t("profile.empty"));
             return;
         }
 
-        String axesJson = objectOf(response, "axes");
-        for (String axis : axes) {
-            String axisJson = objectOf(axesJson, axis);
-            double score = numberAsDouble(axisJson, "score");
-            long ceiling = Json.number(axisJson, "ceiling", 0);
-            double foundation = numberAsDouble(axisJson, "foundation");
-
-            console.print("  %-5s %s  %4.1f   потолок %d, фундамент %.0f%%".formatted(
-                    axis, bar(score), score, ceiling, foundation * 100));
+        double profileMax = profile.get("axisMax").asDouble(FALLBACK_AXIS_MAX);
+        for (String axis : names) {
+            Json.Node a = axes.get(axis);
+            double score = a.get("score").asDouble(0);
+            double max = a.get("maxScore").asDouble(profileMax);
+            double fill = a.get("fill").isNumber() ? a.get("fill").asDouble(0) : (max > 0 ? score / max : 0);
+            console.print(Msg.t("profile.axis", axis, bar(fill), score,
+                    a.get("ceiling").asLong(0), percent(a.get("foundation").asDouble(0))));
         }
         console.print("");
     }
 
-    /**
-     * Имена осей — ключи объекта {@code axes}.
-     * <p>
-     * Порядок сохраняем тот, что прислал сервер: он идёт от сильных
-     * к слабым (или как решит платформа), и пересортировывать на клиенте
-     * значит спорить с тем, кто знает больше.
-     */
-    private List<String> axisNames(String response) {
-        String axesJson = objectOf(response, "axes");
-        List<String> names = new ArrayList<>();
-        int depth = 0;
-        boolean inString = false;
-        StringBuilder current = new StringBuilder();
-
-        for (int i = 0; i < axesJson.length(); i++) {
-            char c = axesJson.charAt(i);
-            if (inString) {
-                if (c == '"') {
-                    inString = false;
-                    // Ключ верхнего уровня — тот, после которого идёт ':'
-                    if (depth == 1 && next(axesJson, i) == ':') {
-                        names.add(current.toString());
-                    }
-                    current.setLength(0);
-                } else {
-                    current.append(c);
-                }
-                continue;
-            }
-            switch (c) {
-                case '"' -> inString = true;
-                case '{' -> depth++;
-                case '}' -> depth--;
-                default -> {
-                    // прочее не интересует
-                }
-            }
-        }
-        return names;
-    }
-
-    private char next(String text, int from) {
-        for (int i = from + 1; i < text.length(); i++) {
-            if (!Character.isWhitespace(text.charAt(i))) {
-                return text.charAt(i);
-            }
-        }
-        return '\0';
-    }
-
-    /**
-     * Полоска. Не проценты и не звёздочки — глазом видно перекос профиля,
-     * а он и есть главное, что профиль показывает.
-     */
-    private String bar(double score) {
-        int filled = (int) Math.round(Math.min(score, MAX_SCORE) / MAX_SCORE * BAR_WIDTH);
+    /** Полоска. Глазом виден перекос профиля, а он и есть главное. */
+    static String bar(double fill) {
+        double clamped = Math.max(0, Math.min(1, fill));
+        int filled = (int) Math.round(clamped * BAR_WIDTH);
         return "█".repeat(filled) + "·".repeat(BAR_WIDTH - filled);
     }
 
-    /** Вырезает вложенный объект по имени поля. */
-    private String objectOf(String json, String field) {
-        String needle = '"' + field + "\":{";
-        int start = json.indexOf(needle);
-        if (start < 0) {
-            return "{}";
+    /** Доля 0..1 — процентами; меньше процента, но не ноль — «&lt;1». */
+    static String percent(double share) {
+        double value = share * 100;
+        if (value > 0 && value < 1) {
+            return "<1";
         }
-        start += needle.length() - 1;
-
-        int depth = 0;
-        for (int i = start; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '{') {
-                depth++;
-            } else if (c == '}') {
-                depth--;
-                if (depth == 0) {
-                    return json.substring(start, i + 1);
-                }
-            }
-        }
-        return "{}";
+        return String.valueOf(Math.round(value));
     }
-
-    /**
-     * Дробное число. {@link Json#number} отдаёт целое, а score и foundation
-     * дробные — читаем вручную.
-     */
-    private double numberAsDouble(String json, String field) {
-        String needle = '"' + field + "\":";
-        int at = json.indexOf(needle);
-        if (at < 0) {
-            return 0;
-        }
-        int start = at + needle.length();
-        while (start < json.length() && Character.isWhitespace(json.charAt(start))) {
-            start++;
-        }
-        int end = start;
-        while (end < json.length() && "-.0123456789eE".indexOf(json.charAt(end)) >= 0) {
-            end++;
-        }
-        try {
-            return Double.parseDouble(json.substring(start, end));
-        } catch (RuntimeException e) {
-            return 0;
-        }
-    }
-
 }

@@ -1,135 +1,116 @@
 package io.hammerhall.cli.command;
 
 import io.hammerhall.cli.ApiClient;
+import io.hammerhall.cli.Args;
 import io.hammerhall.cli.CliException;
-import io.hammerhall.cli.Config;
 import io.hammerhall.cli.Console;
+import io.hammerhall.cli.Context;
 import io.hammerhall.cli.ForgeRoot;
+import io.hammerhall.cli.Ids;
 import io.hammerhall.cli.Json;
+import io.hammerhall.cli.Msg;
+import io.hammerhall.cli.SafeFiles;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Arrays;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
  * Забрать задачу из кузницы и положить файл в свой проект.
  *
- * <h3>Зачем команда существует</h3>
- *
- * Закрывает сценарий «бесплатные кончились, оплатил, хочу ещё». Без неё
- * человек может только решать то, что уже лежит в его клоне: новые задачи
- * взять неоткуда, а раздавать их форком репозитория — значит раздавать
- * весь корпус сразу, включая платный.
- *
- * <p>Платформа проверяет уровень доступа сама и на закрытую задачу отвечает
- * 404, а не 403: подтверждать существование недоступной задачи не нужно.
- * Клиент этой логики не знает и знать не должен.
+ * <p>Закрывает сценарий «бесплатные кончились, оплатил, хочу ещё». Уровень
+ * доступа проверяет платформа (на закрытую задачу — 404), квоту выдачи —
+ * тоже она (429 с текстом — его клиент и печатает).
  *
  * <h3>Куда кладётся файл</h3>
  *
- * В пакет, объявленный в самом тексте задачи. Пакет не угадывается и не
- * настраивается: стандарт кузницы требует, чтобы пакет задачи отражал её
- * место в лестнице, и единственный правдивый источник — присланный текст.
+ * В пакет, объявленный в самом тексте задачи. Имя файла — номер задачи
+ * в том виде, в каком его вернула ПЛАТФОРМА (поле {@code id}), а не в том,
+ * какой набрал человек: {@code pull movcode0002} до 0.2.0 клал на диск
+ * {@code movcode0002.java} с {@code public class MovCode0002} внутри —
+ * файл не компилировался, и человек чинил не то (ревью CLI №1, СР-5).
+ * По стандарту кузницы имя класса и есть номер задачи.
  *
  * <h3>Чужую работу не затираем</h3>
  *
- * Если файл уже есть, команда отказывается работать. Человек мог решать эту
- * задачу неделю, и молчаливая перезапись стёрла бы решение без возможности
- * восстановить. Перезапись — только явным {@code --force}.
+ * Файл есть — команда отказывается. {@code --force} перезаписывает, но
+ * прежний файл сначала откладывается рядом, {@code MovCode0002.java.bak}:
+ * человек мог решать задачу неделю, и до 0.2.0 флаг стирал её без
+ * возможности вернуть (СР-6). Запись — целиком или никак.
  */
-public class PullCommand {
-
-    /**
-     * Идентификатор задачи попадает и в URL, и в имя файла, поэтому
-     * проверяется до всякого использования: {@code ../../etc/passwd} не
-     * должен доехать ни до сервера, ни до файловой системы.
-     */
-    private static final Pattern TASK_ID = Pattern.compile("[A-Za-z][A-Za-z0-9]{0,31}");
+public final class PullCommand implements Command {
 
     /** Часть пакета — обычный Java-идентификатор, и ничего больше. */
     private static final Pattern PACKAGE_PART = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
 
-    private final Console console;
-
-    public PullCommand(Console console) {
-        this.console = console;
+    @Override
+    public String name() {
+        return "pull";
     }
 
-    public int run(String[] args) throws IOException {
-        if (args.length == 0) {
-            throw new CliException("""
-                    Укажите задачу:
-                        hammerhall pull MovCode0002""");
+    @Override
+    public Set<String> flags() {
+        return Set.of("--force");
+    }
+
+    @Override
+    public int run(Args args, Context context) throws IOException {
+        args.requireCount(1, 1, "hammerhall pull MovCode0002");
+        String asked = Ids.task(stripJava(args.rest().getFirst()));
+        ForgeRoot.Found forge = context.forge();
+        Console console = context.console();
+
+        console.dim(Msg.t("pull.taking", asked));
+        Json.Node task;
+        try (ApiClient api = context.authorized()) {
+            task = api.get("tasks", forge.id(), asked).body();
         }
 
-        boolean force = Arrays.asList(args).contains("--force");
-        String taskId = taskIdOf(args[0]);
-
-        Path root = ForgeRoot.find();
-        Config config = Config.load(root);
-        String forgeId = ForgeRoot.forgeId(root);
-
-        console.dim("Забираю " + taskId + "…");
-
-        String response = new ApiClient(config.api(), config.token())
-                .get("/tasks/" + forgeId + "/" + taskId);
-
-        String source = Json.string(response, "source");
-        if (source == null || source.isBlank()) {
-            // Задача в каталоге есть, а текста нет: артефакт выдачи ещё не
-            // залит на платформу. Это не ошибка человека, и говорить надо так.
-            throw new CliException(
-                    "Текст задачи " + taskId + " ещё не выложен на платформу. "
-                            + "Это не ваша ошибка — попробуйте позже.");
+        String source = task.get("source").text();
+        if (source == null) {
+            // Задача в каталоге есть, а текста нет: артефакт выдачи ещё
+            // не залит. Это не ошибка человека, и говорить надо так.
+            throw new CliException(Msg.t("pull.nosource", asked));
         }
+        String id = task.get("id").text();
+        String taskId = id != null && Ids.TASK.matcher(id).matches() ? id : asked;
 
-        Path target = targetPath(root, source, taskId);
-        write(target, source, force);
+        Path target = targetPath(forge.root(), source, taskId);
+        if (Files.exists(target)) {
+            if (!args.has("--force")) {
+                throw new CliException(Msg.t("pull.exists", ForgeRoot.shown(forge.root(), target), taskId));
+            }
+            Path backup = backupOf(target);
+            Files.move(target, backup);
+            console.warn(Msg.t("pull.backup", ForgeRoot.shown(forge.root(), backup)));
+        }
+        SafeFiles.write(target, source);
 
-        report(response, taskId, root.relativize(target));
+        report(console, task, taskId, ForgeRoot.shown(forge.root(), target));
         return 0;
     }
 
-    // ---------- разбор аргумента ----------
-
     /** Принимаем и {@code MovCode0002}, и {@code MovCode0002.java}. */
-    static String taskIdOf(String argument) {
-        String id = argument.endsWith(".java")
-                ? argument.substring(0, argument.length() - ".java".length())
-                : argument;
-
-        if (!TASK_ID.matcher(id).matches()) {
-            throw new CliException("Это не похоже на идентификатор задачи: " + argument);
-        }
-        return id;
+    static String stripJava(String argument) {
+        return argument.endsWith(".java") ? argument.substring(0, argument.length() - ".java".length()) : argument;
     }
 
-    // ---------- куда класть ----------
-
     /**
-     * Путь файла: {@code src/main/java} + пакет из текста задачи + имя класса.
-     * <p>
-     * Пакета в тексте нет — кладём в корень исходников. Такого по стандарту
-     * кузницы быть не должно, но падать из-за этого незачем: файл человек
-     * получит, а поправить место сможет сам.
+     * Путь файла: {@code src/main/java} + пакет из текста задачи + имя.
+     * Пакета нет — корень исходников: файл человек получит, место поправит сам.
      */
     static Path targetPath(Path root, String source, String taskId) {
         Path dir = root.resolve("src/main/java");
         String declared = packageOf(source);
-
         if (declared != null) {
-            // split с -1: без него Java МОЛЧА отбрасывает пустые хвосты, и
-            // испорченный «io...» превращался бы в невинный «io» — файл уехал
-            // бы не туда, а человек не узнал бы почему. Пустая часть здесь
-            // такой же признак поломки, как слэш.
+            // split с -1: без него пустые хвосты отбрасываются молча, и «io..»
+            // превратился бы в невинный «io».
             for (String part : declared.split("\\.", -1)) {
                 if (!PACKAGE_PART.matcher(part).matches()) {
-                    // Пакет пришёл с сервера, и доверять ему на слово нельзя:
-                    // «..» или слэш увели бы запись за пределы кузницы.
-                    throw new CliException("Испорченный пакет в тексте задачи: " + declared);
+                    // Пакет пришёл с сервера: «..» или слэш увели бы запись за пределы кузницы.
+                    throw new CliException(Msg.t("pull.package.bad", declared));
                 }
                 dir = dir.resolve(part);
             }
@@ -138,91 +119,60 @@ public class PullCommand {
     }
 
     /**
-     * Объявление пакета из исходника.
-     * <p>
-     * Ищем до первого {@code import} или объявления типа: дальше объявления
-     * пакета быть не может, а слово «package» в комментарии ниже — запросто.
+     * Объявление пакета. Ищем до первого {@code import} или объявления
+     * типа: слово «package» в комментарии ниже — запросто.
      */
     static String packageOf(String source) {
         for (String raw : source.lines().toList()) {
             String line = raw.strip();
-
             if (line.startsWith("package ") && line.endsWith(";")) {
                 return line.substring("package ".length(), line.length() - 1).strip();
             }
-            if (line.startsWith("import ")
-                    || line.startsWith("class ")
-                    || line.startsWith("public ")
-                    || line.startsWith("final ")
-                    || line.startsWith("abstract ")) {
+            if (line.startsWith("import ") || line.startsWith("class ") || line.startsWith("public ")
+                    || line.startsWith("final ") || line.startsWith("abstract ") || line.startsWith("void ")
+                    || line.startsWith("record ") || line.startsWith("interface ") || line.startsWith("enum ")) {
                 return null;
             }
         }
         return null;
     }
 
-    // ---------- запись ----------
-
-    static void write(Path target, String source, boolean force) throws IOException {
-        if (Files.exists(target) && !force) {
-            throw new CliException("""
-                    Файл уже есть: %s
-                    Ваше решение не тронуто. Перезаписать текстом задачи:
-                        hammerhall pull %s --force"""
-                    .formatted(target.getFileName(),
-                            target.getFileName().toString().replace(".java", "")));
+    /** {@code X.java.bak}, занято — {@code X.java.bak.1}, {@code .2}… Прежние отложенные не трогаем. */
+    static Path backupOf(Path target) {
+        Path backup = target.resolveSibling(target.getFileName() + ".bak");
+        for (int n = 1; Files.exists(backup); n++) {
+            backup = target.resolveSibling(target.getFileName() + ".bak." + n);
         }
-
-        Path parent = target.getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
-        }
-        Files.writeString(target, source, StandardCharsets.UTF_8);
+        return backup;
     }
 
-    // ---------- вывод ----------
-
     /**
-     * Показать, что забрали, и куда положили.
-     *
-     * <p>Пакетная видимость — ради теста, по той же причине, что и
-     * {@code ProfileCommand.print}: здесь весь разбор ответа платформы
-     * и всё форматирование, то есть ровно то, что ломается молча.
-     * Переименуй платформа поле {@code displayName} — человек увидит
-     * голый номер задачи вместо названия, и никакой ошибки при этом
-     * не произойдёт.
-     *
-     * <p>⚠️ Все три поля необязательны, и каждое отсутствующее меняет
-     * форму вывода. Собрать «ступень 3 · ведущая ось …» из того, чего
-     * нет, легко: разделитель повиснет в воздухе, а {@code null}
-     * напечатается словом.
+     * Что забрали и куда положили. Все три поля карточки необязательны,
+     * и каждое отсутствующее меняет форму вывода: разделитель не должен
+     * повиснуть в воздухе, а {@code null} — напечататься словом.
      */
-    void report(String response, String taskId, Path relativePath) {
-        String name = Json.string(response, "displayName");
-        String stage = Json.string(response, "stage");
-        String leadAxis = Json.string(response, "leadAxis");
+    private static void report(Console console, Json.Node task, String taskId, String relativePath) {
+        String name = task.get("displayName").text();
+        String stage = task.get("stage").text();
+        String leadAxis = task.get("leadAxis").text();
 
-        console.success(name == null || name.isBlank()
-                ? taskId
-                : taskId + " — " + name);
+        console.success(name == null ? taskId : taskId + " — " + name);
         console.print("  " + relativePath);
 
         StringBuilder about = new StringBuilder();
-        if (stage != null && !stage.isBlank()) {
-            about.append("ступень ").append(stage);
+        if (stage != null) {
+            about.append(Msg.t("pull.stage", stage));
         }
-        if (leadAxis != null && !leadAxis.isBlank()) {
+        if (leadAxis != null) {
             if (!about.isEmpty()) {
                 about.append(" · ");
             }
-            about.append("ведущая ось ").append(leadAxis);
+            about.append(Msg.t("pull.axis", leadAxis));
         }
         if (!about.isEmpty()) {
             console.dim("  " + about);
         }
-
         console.print("");
-        console.print("Решайте и отправляйте:");
-        console.print("  hammerhall submit " + taskId + ".java");
+        console.print(Msg.t("pull.next", taskId));
     }
 }
