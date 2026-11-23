@@ -3,171 +3,175 @@ package io.hammerhall.cli;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Самописный разбор JSON — самое хрупкое место клиента.
+ * Один разборщик вместо четырёх (ревью CLI №1, АРХ-1).
  *
- * <h3>Почему именно он</h3>
- *
- * Это единственный кусок клиента, который МОЛЧА возвращает не то. Ошибётся
- * `ForgeRoot` — человек увидит внятное «это не похоже на кузницу». Ошибётся
- * `ApiClient` — увидит текст ошибки. А промахнувшийся разбор поля просто
- * отдаст {@code null} или чужое значение, и вердикт напечатается неправильным
- * без единого признака поломки.
- *
- * <h3>Что охраняется</h3>
- *
- * Главный инвариант — <b>глубина</b>. Поле {@code "status"} встречается и на
- * верхнем уровне, и внутри {@code "tests"}; без учёта вложенности разбор взял
- * бы первое попавшееся. Второй инвариант — <b>строки</b>: имя поля, упомянутое
- * внутри текста лога, не должно сойти за поле.
+ * <p>Каждый случай с пометкой — поломка 0.1.4, найденная ревью
+ * воспроизведением: заплатки в командах ломались от пробела после
+ * двоеточия, от массива верхнего уровня, путали ключ со значением
+ * и обрезали дробное. Здесь они — навсегда под тестом.
  */
-@DisplayName("Json — чтение полей верхнего уровня")
+@DisplayName("Json — разбор и запись")
 class JsonTest {
 
-    /** Ответ платформы на /submit — форма, ради которой класс и написан. */
-    private static final String VERDICT = """
-            {"taskId":"MovCode0002",
-             "status":"PASSED",
-             "durationMs":1007,
-             "fromHistory":false,
-             "tests":{"total":10,"passed":10,"failed":0,"status":"ВЛОЖЕННЫЙ"},
-             "failures":[],
-             "log":"тут упоминается \\"status\\" внутри текста"}
-            """;
-
     @Nested
-    @DisplayName("строки")
-    class Strings {
+    @DisplayName("🔴 поломки 0.1.4, найденные ревью")
+    class Regressions {
 
         @Test
-        @DisplayName("поле верхнего уровня читается")
-        void readsTopLevel() {
-            assertThat(Json.string(VERDICT, "status")).isEqualTo("PASSED");
-            assertThat(Json.string(VERDICT, "taskId")).isEqualTo("MovCode0002");
+        @DisplayName("ВЫС-1: пробелы и переносы — вложенный объект читается так же, как слитный")
+        void prettyPrinted() {
+            String compact = "{\"status\":\"FAILED\",\"tests\":{\"total\":5,\"passed\":3}}";
+            String pretty = """
+                    {
+                      "status" : "FAILED",
+                      "tests" : { "total" : 5, "passed" : 3 }
+                    }""";
+            for (String text : List.of(compact, pretty)) {
+                Json.Node tests = Json.parse(text).get("tests");
+                assertThat(tests.get("total").asLong(0)).isEqualTo(5);
+                assertThat(tests.get("passed").asLong(0)).isEqualTo(3);
+            }
         }
 
         @Test
-        @DisplayName("🔴 одноимённое поле ВНУТРИ вложенного объекта не подменяет верхнее")
-        void nestedFieldDoesNotShadow() {
-            // "status" есть и в корне, и в "tests". Без учёта глубины разбор
-            // вернул бы вложенный — и вердикт напечатался бы неправильным.
-            assertThat(Json.string(VERDICT, "status")).isEqualTo("PASSED");
+        @DisplayName("ВЫС-1: объект внутри объекта не обрезается на первой «}»")
+        void nestedDeeper() {
+            Json.Node tests = Json.parse("{\"tests\":{\"detail\":{\"x\":1},\"total\":7}}").get("tests");
+            assertThat(tests.get("total").asLong(0)).isEqualTo(7);
         }
 
         @Test
-        @DisplayName("🔴 имя поля внутри текста лога полем не считается")
-        void fieldNameInsideStringIgnored() {
-            String json = """
-                    {"log":"строка со словом \\"status\\" внутри","status":"FAILED"}
-                    """;
-            assertThat(Json.string(json, "status")).isEqualTo("FAILED");
+        @DisplayName("ВЫС-2: массив верхнего уровня — читается")
+        void topLevelArray() {
+            Json.Node list = Json.parse("[{\"status\":\"PASSED\"},{\"status\":\"FAILED\"}]");
+            assertThat(list.isArray()).isTrue();
+            assertThat(list.items()).extracting(n -> n.get("status").string())
+                    .containsExactly("PASSED", "FAILED");
         }
 
         @Test
-        @DisplayName("экранирование разворачивается")
-        void unescapes() {
-            String json = """
-                    {"log":"перенос\\nи кавычка \\" и таб\\tконец"}
-                    """;
-            assertThat(Json.string(json, "log"))
-                    .isEqualTo("перенос\nи кавычка \" и таб\tконец");
+        @DisplayName("ВЫС-3: строковое значение, равное имени поля, — не поле")
+        void valueIsNotKey() {
+            Json.Node node = Json.parse("{\"log\":\"status\",\"code\":42}");
+            assertThat(node.get("status").isMissing()).isTrue();
+            assertThat(node.get("log").string()).isEqualTo("status");
         }
 
         @Test
-        @DisplayName("нет поля — null; поле не строка — null")
-        void missingOrWrongTypeIsNull() {
-            assertThat(Json.string(VERDICT, "нетТакого")).isNull();
-            assertThat(Json.string(VERDICT, "durationMs")).isNull();
-        }
-    }
-
-    @Nested
-    @DisplayName("числа и флаги")
-    class Numbers {
-
-        @Test
-        @DisplayName("число читается, отрицательное тоже")
-        void readsNumber() {
-            assertThat(Json.number(VERDICT, "durationMs", -1)).isEqualTo(1007);
-            assertThat(Json.number("""
-                    {"delta":-42}""", "delta", 0)).isEqualTo(-42);
-        }
-
-        @Test
-        @DisplayName("нет поля или не число — отдаётся запасное значение")
-        void fallsBack() {
-            assertThat(Json.number(VERDICT, "нетТакого", 7)).isEqualTo(7);
-            assertThat(Json.number(VERDICT, "status", 7)).isEqualTo(7);
-        }
-
-        @Test
-        @DisplayName("флаг читается отдельным методом — строковый разбор его не видит")
-        void readsBool() {
-            assertThat(Json.bool(VERDICT, "fromHistory", true)).isFalse();
-            assertThat(Json.bool("""
-                    {"fromHistory":true}""", "fromHistory", false)).isTrue();
-            assertThat(Json.bool(VERDICT, "нетТакого", true)).isTrue();
-        }
-    }
-
-    @Nested
-    @DisplayName("массивы")
-    class Arrays {
-
-        @Test
-        @DisplayName("массив строк читается, пустой даёт пустой список")
-        void readsArray() {
-            String json = """
-                    {"forges":["stream-forge","reactive-forge"],"failures":[]}
-                    """;
-            assertThat(Json.strings(json, "forges"))
-                    .containsExactly("stream-forge", "reactive-forge");
-            assertThat(Json.strings(json, "failures")).isEmpty();
-        }
-
-        @Test
-        @DisplayName("нет поля — пустой список, а не null")
-        void missingArrayIsEmpty() {
-            assertThat(Json.strings(VERDICT, "нетТакого")).isEmpty();
-        }
-    }
-
-    @Nested
-    @DisplayName("экранирование на отправку")
-    class Escaping {
-
-        @Test
-        @DisplayName("🔴 круг: экранировали код задачи → прочитали обратно тем же")
-        void roundTrip() {
-            // Ровно то, что делает submit: файл с кавычками, переносами и
-            // табами уезжает в тело запроса и обязан вернуться собой.
-            String code = "class A {\n\tString s = \"строка\\с экраном\";\r\n}";
-
-            String json = "{\"code\":\"" + Json.escape(code) + "\"}";
-
-            assertThat(Json.string(json, "code")).isEqualTo(code);
-        }
-
-        @Test
-        @DisplayName("управляющие символы уходят в \\u-форму")
-        void escapesControlChars() {
-            assertThat(Json.escape("a\u0001b")).isEqualTo("a\\u0001b");
+        @DisplayName("СР-12: дробное не режется")
+        void fractions() {
+            Json.Node node = Json.parse("{\"points\":12.5,\"e\":1.5e2,\"neg\":-0.25}");
+            assertThat(node.get("points").asDouble(0)).isEqualTo(12.5);
+            assertThat(node.get("e").asDouble(0)).isEqualTo(150.0);
+            assertThat(node.get("neg").asDouble(0)).isEqualTo(-0.25);
+            assertThat(node.get("points").asLong(0)).isEqualTo(13);   // округление, а не отсечение
         }
     }
 
     @Test
-    @DisplayName("массив объектов: поле верхнего уровня после него всё ещё находится")
-    void survivesArrayOfObjects() {
-        String json = """
-                {"failures":[{"test":"a","status":"ВЛОЖЕННЫЙ"},{"test":"b"}],
-                 "status":"FAILED"}
-                """;
-        assertThat(Json.string(json, "status")).isEqualTo("FAILED");
-        assertThat(Json.strings(json, "нетТакого")).isEmpty();
+    @DisplayName("строки: экранирование, \\u, суррогатная пара — эмодзи целиком")
+    void strings() {
+        Json.Node node = Json.parse("{\"a\":\"кавычка \\\" слэш \\\\ \\/ \\n\\t\\r\\b\\f\",\"e\":\"\\ud83d\\udd25\",\"u\":\"\\u0416\"}");
+        assertThat(node.get("a").string()).isEqualTo("кавычка \" слэш \\ / \n\t\r\b\f");
+        assertThat(node.get("e").string()).isEqualTo("🔥");
+        assertThat(node.get("u").string()).isEqualTo("Ж");
+    }
+
+    @Test
+    @DisplayName("литералы и навигация: нет поля, не тот тип — MISSING, а не исключение")
+    void literalsAndMissing() {
+        Json.Node node = Json.parse("{\"t\":true,\"f\":false,\"n\":null,\"s\":\"x\",\"arr\":[\"a\",1,\"b\"]}");
+        assertThat(node.get("t").asBool(false)).isTrue();
+        assertThat(node.get("f").asBool(true)).isFalse();
+        assertThat(node.get("n").isMissing()).isFalse();
+        assertThat(node.get("n").string()).isNull();
+        assertThat(node.get("nope").get("deeper").asLong(-1)).isEqualTo(-1);
+        assertThat(node.get("s").asLong(7)).isEqualTo(7);
+        assertThat(node.get("s").get("x").isMissing()).isTrue();
+        assertThat(node.get("arr").strings()).containsExactly("a", "b");
+        assertThat(node.get("s").items()).isEmpty();
+        assertThat(node.get("s").keys()).isEmpty();
+        assertThat(node.get("arr").isObject()).isFalse();
+        assertThat(node.isObject()).isTrue();
+        assertThat(Json.parse("{\"b\":\"  \"}").get("b").text()).isNull();
+    }
+
+    @Test
+    @DisplayName("ключи объекта — в порядке ответа сервера")
+    void keyOrder() {
+        assertThat(Json.parse("{\"SEQ\":1,\"JOIN\":2,\"ALGO\":3}").keys()).containsExactly("SEQ", "JOIN", "ALGO");
+    }
+
+    @Test
+    @DisplayName("пустые объект и массив")
+    void empties() {
+        assertThat(Json.parse(" { } ").keys()).isEmpty();
+        assertThat(Json.parse("[ ]").items()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "{", "{\"a\"}", "{\"a\":1,}", "[1 2]", "{\"a\":tru}", "\"не закрыта",
+            "{\"a\":1} лишнее", "{a:1}", "{\"a\":\"\\x\"}", "{\"a\":\"\\u12\"}", "{\"a\":\"\\uzzzz\"}",
+            "{\"a\":1-2}", "@", "{\"a\":\"перевод\nстроки\"}", "[1,", "{\"a\":1"})
+    @DisplayName("испорченный JSON — понятная ошибка с позицией, а не «прочитал сколько смог»")
+    void malformed(String text) {
+        assertThatThrownBy(() -> Json.parse(text))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("JSON");
+    }
+
+    @Test
+    @DisplayName("null вместо текста — ошибка")
+    void nullText() {
+        assertThatThrownBy(() -> Json.parse(null)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Nested
+    @DisplayName("запись")
+    class Writing {
+
+        @Test
+        @DisplayName("ВЫС-9: экранируется каждое значение — и номер, и кузница, не только код")
+        void everyValueEscaped() {
+            String body = Json.object("forgeId", "a\"b", "taskId", "x\\y", "code", "line\n\"q\"\u0001");
+            Json.Node back = Json.parse(body);
+            assertThat(back.get("forgeId").string()).isEqualTo("a\"b");
+            assertThat(back.get("taskId").string()).isEqualTo("x\\y");
+            assertThat(back.get("code").string()).isEqualTo("line\n\"q\"\u0001");
+            assertThat(body).contains("\\u0001");
+        }
+
+        @Test
+        @DisplayName("дерево туда и обратно")
+        void roundTrip() {
+            Map<String, Object> tree = new LinkedHashMap<>();
+            tree.put("n", null);
+            tree.put("b", true);
+            tree.put("i", 42);
+            tree.put("l", List.of("a", 1, false));
+            tree.put("m", Map.of("k", "v"));
+            String text = Json.write(tree);
+            assertThat(text).isEqualTo("{\"n\":null,\"b\":true,\"i\":42,\"l\":[\"a\",1,false],\"m\":{\"k\":\"v\"}}");
+            assertThat(Json.parse(text).compact()).isEqualTo(text);
+            assertThat(Json.Node.MISSING.compact()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("нечётные пары и незнакомый тип — ошибка разработчика, а не молчание")
+        void misuse() {
+            assertThatThrownBy(() -> Json.object("a")).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> Json.write(new Object())).isInstanceOf(IllegalArgumentException.class);
+        }
     }
 }

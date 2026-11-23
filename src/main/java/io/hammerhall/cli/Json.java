@@ -1,199 +1,289 @@
 package io.hammerhall.cli;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Чтение полей верхнего уровня из JSON — ровно столько, сколько нужно клиенту.
+ * JSON: один настоящий разборщик и запись — без зависимостей.
  *
- * <h3>Почему не Jackson</h3>
+ * <h3>Почему так, а не Jackson</h3>
  *
- * Клиент должен оставаться jar без зависимостей: обёртка качает его при
- * первом запуске, и лишние мегабайты там ни к чему. А читаем мы ответы,
- * которые сами же формируем на сервере — их форма известна и стабильна.
+ * Клиент — один jar без зависимостей: обёртка качает его при первом запуске.
+ * Правило хорошее, и оно остаётся. Но до 0.2.0 оно съело другое правило —
+ * «один источник истины»: разборщиков было ЧЕТЫРЕ ({@code Json} по полям
+ * верхнего уровня и три заплатки в командах, вырезавшие вложенные объекты
+ * подстрокой). Заплатки ломались от пробела после двоеточия, от массива
+ * верхнего уровня, путали ключ со строковым значением и обрезали дробные
+ * числа — молча, без ошибки (ревью CLI №1, АРХ-1, ВЫС-1, ВЫС-2, ВЫС-3, СР-12).
  *
- * <h3>⚠️ Чего этот класс НЕ умеет</h3>
+ * <p>Здесь — обычный рекурсивный спуск по грамматике RFC 8259: дерево из
+ * {@link Map} (порядок ключей — как прислал сервер), {@link List},
+ * {@link String}, {@link BigDecimal}, {@link Boolean} и {@code null}.
+ * Чтение — через {@link Node}: отсутствующее поле даёт не исключение
+ * и не тихий ноль, а явный {@link Node#MISSING}, и вызывающий решает сам,
+ * что для него значит «нет поля».
  *
- * Это не парсер JSON и не претендует им быть. Он не разбирает вложенные
- * объекты произвольной глубины, не проверяет синтаксис, не сообщает
- * об ошибках формата. Если ответ платформы усложнится — заводить Jackson,
- * а не достраивать это.
- *
- * <p>Что умеет: достать строку, число и массив строк по имени поля
- * с учётом экранирования и вложенных структур, которые надо пропустить.
+ * <p>⚠️ Испорченный JSON — {@link IllegalArgumentException} с позицией:
+ * его ловит {@link ApiClient} и говорит человеку «платформа ответила
+ * не JSON», а не печатает стектрейс.
  */
 public final class Json {
 
-    private Json() {
+    private final String text;
+    private int at;
+
+    private Json(String text) {
+        this.text = text;
     }
 
-    /** Строковое поле верхнего уровня. Нет поля — {@code null}. */
-    public static String string(String json, String field) {
-        int valueAt = valuePosition(json, field);
-        if (valueAt < 0 || json.charAt(valueAt) != '"') {
-            return null;
+    /** Разобрать текст целиком. Мусор после значения — ошибка, а не «прочитал сколько смог». */
+    public static Node parse(String text) {
+        if (text == null) {
+            throw new IllegalArgumentException("пустой ответ");
         }
-        StringBuilder result = new StringBuilder();
-        for (int i = valueAt + 1; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '\\' && i + 1 < json.length()) {
-                i++;
-                result.append(unescape(json.charAt(i), json, i));
-                if (json.charAt(i) == 'u') {
-                    i += 4;
+        Json parser = new Json(text);
+        parser.skipSpace();
+        Object value = parser.value();
+        parser.skipSpace();
+        if (parser.at != text.length()) {
+            throw parser.error("лишние символы после значения");
+        }
+        return new Node(value);
+    }
+
+    // ---------- разбор ----------
+
+    private Object value() {
+        if (at >= text.length()) {
+            throw error("значение оборвано");
+        }
+        char c = text.charAt(at);
+        return switch (c) {
+            case '{' -> object();
+            case '[' -> array();
+            case '"' -> string();
+            case 't' -> literal("true", Boolean.TRUE);
+            case 'f' -> literal("false", Boolean.FALSE);
+            case 'n' -> literal("null", null);
+            default -> {
+                if (c == '-' || (c >= '0' && c <= '9')) {
+                    yield number();
                 }
-                continue;
+                throw error("неожиданный символ '" + c + "'");
             }
+        };
+    }
+
+    private Map<String, Object> object() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        at++;   // {
+        skipSpace();
+        if (peek() == '}') {
+            at++;
+            return result;
+        }
+        while (true) {
+            skipSpace();
+            if (peek() != '"') {
+                throw error("ожидался ключ в кавычках");
+            }
+            String key = string();
+            skipSpace();
+            expect(':');
+            skipSpace();
+            result.put(key, value());
+            skipSpace();
+            char next = peek();
+            at++;
+            if (next == '}') {
+                return result;
+            }
+            if (next != ',') {
+                throw error("ожидалась ',' или '}'");
+            }
+        }
+    }
+
+    private List<Object> array() {
+        List<Object> result = new ArrayList<>();
+        at++;   // [
+        skipSpace();
+        if (peek() == ']') {
+            at++;
+            return result;
+        }
+        while (true) {
+            skipSpace();
+            result.add(value());
+            skipSpace();
+            char next = peek();
+            at++;
+            if (next == ']') {
+                return result;
+            }
+            if (next != ',') {
+                throw error("ожидалась ',' или ']'");
+            }
+        }
+    }
+
+    private String string() {
+        at++;   // открывающая кавычка
+        StringBuilder result = new StringBuilder();
+        while (at < text.length()) {
+            char c = text.charAt(at++);
             if (c == '"') {
                 return result.toString();
             }
+            if (c == '\\') {
+                if (at >= text.length()) {
+                    break;
+                }
+                char escaped = text.charAt(at++);
+                switch (escaped) {
+                    case '"', '\\', '/' -> result.append(escaped);
+                    case 'b' -> result.append('\b');
+                    case 'f' -> result.append('\f');
+                    case 'n' -> result.append('\n');
+                    case 'r' -> result.append('\r');
+                    case 't' -> result.append('\t');
+                    case 'u' -> {
+                        // Суррогатная пара приходит двумя \\u подряд — и как два
+                        // char складывается в один эмодзи сама, без особой ветки.
+                        if (at + 4 > text.length()) {
+                            throw error("оборванное \\u");
+                        }
+                        try {
+                            result.append((char) Integer.parseInt(text.substring(at, at + 4), 16));
+                        } catch (NumberFormatException e) {
+                            throw error("неверное \\u");
+                        }
+                        at += 4;
+                    }
+                    default -> throw error("неизвестная последовательность \\" + escaped);
+                }
+                continue;
+            }
+            if (c < 0x20) {
+                throw error("управляющий символ внутри строки");
+            }
             result.append(c);
         }
-        return null;
+        throw error("строка не закрыта");
     }
 
-    /** Числовое поле верхнего уровня. Нет поля или не число — {@code fallback}. */
-    public static long number(String json, String field, long fallback) {
-        int valueAt = valuePosition(json, field);
-        if (valueAt < 0) {
-            return fallback;
+    private BigDecimal number() {
+        int start = at;
+        if (peek() == '-') {
+            at++;
         }
-        int end = valueAt;
-        while (end < json.length() && "-0123456789".indexOf(json.charAt(end)) >= 0) {
-            end++;
-        }
-        if (end == valueAt) {
-            return fallback;
+        while (at < text.length() && "0123456789.eE+-".indexOf(text.charAt(at)) >= 0) {
+            at++;
         }
         try {
-            return Long.parseLong(json.substring(valueAt, end));
+            return new BigDecimal(text.substring(start, at));
         } catch (NumberFormatException e) {
-            return fallback;
+            at = start;
+            throw error("неверное число");
         }
     }
+
+    private Object literal(String word, Object value) {
+        if (!text.startsWith(word, at)) {
+            throw error("неверное значение");
+        }
+        at += word.length();
+        return value;
+    }
+
+    private void expect(char c) {
+        if (peek() != c) {
+            throw error("ожидалось '" + c + "'");
+        }
+        at++;
+    }
+
+    private char peek() {
+        return at < text.length() ? text.charAt(at) : '\0';
+    }
+
+    private void skipSpace() {
+        while (at < text.length()) {
+            char c = text.charAt(at);
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                return;
+            }
+            at++;
+        }
+    }
+
+    private IllegalArgumentException error(String what) {
+        return new IllegalArgumentException("JSON: " + what + " (позиция " + at + ")");
+    }
+
+    // ---------- запись ----------
 
     /**
-     * Булево поле. Нет поля или значение не {@code true}/{@code false} — {@code fallback}.
-     * <p>
-     * Отдельным методом, потому что {@link #string} на булевом вернёт
-     * {@code null}: значение не в кавычках, и разбор строки его не увидит.
-     */
-    public static boolean bool(String json, String field, boolean fallback) {
-        int valueAt = valuePosition(json, field);
-        if (valueAt < 0) {
-            return fallback;
-        }
-        if (json.startsWith("true", valueAt)) {
-            return true;
-        }
-        if (json.startsWith("false", valueAt)) {
-            return false;
-        }
-        return fallback;
-    }
-
-    /** Массив строк. Нет поля — пустой список. */
-    public static List<String> strings(String json, String field) {
-        List<String> result = new ArrayList<>();
-        int valueAt = valuePosition(json, field);
-        if (valueAt < 0 || json.charAt(valueAt) != '[') {
-            return result;
-        }
-
-        boolean inString = false;
-        StringBuilder current = new StringBuilder();
-        for (int i = valueAt + 1; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (inString) {
-                if (c == '\\' && i + 1 < json.length()) {
-                    i++;
-                    current.append(unescape(json.charAt(i), json, i));
-                    if (json.charAt(i) == 'u') {
-                        i += 4;
-                    }
-                    continue;
-                }
-                if (c == '"') {
-                    result.add(current.toString());
-                    current.setLength(0);
-                    inString = false;
-                    continue;
-                }
-                current.append(c);
-                continue;
-            }
-            if (c == '"') {
-                inString = true;
-            } else if (c == ']') {
-                return result;
-            }
-        }
-        return result;
-    }
-
-    /**
-     * Позиция ЗНАЧЕНИЯ поля верхнего уровня.
+     * Объект из пар «ключ, значение» — для тела запроса.
      *
-     * <p>Ключевое здесь — считать глубину. Поле {@code "status"} может
-     * встретиться и внутри вложенного объекта; без учёта глубины мы бы
-     * взяли первое попавшееся и молча вернули не то. Так же пропускаем
-     * содержимое строк: {@code "log": "поле \"status\" внутри текста"}
-     * не должно сойти за поле.
+     * <p>🔑 Экранируется КАЖДОЕ значение, а не одно избранное. До 0.2.0
+     * тело {@code /submit} собиралось шаблоном, и экранировался только код:
+     * {@code forgeId} и {@code taskId} уходили как есть, и имя каталога
+     * с кавычкой ломало JSON (ревью CLI №1, ВЫС-9).
      */
-    private static int valuePosition(String json, String field) {
-        String needle = '"' + field + '"';
-        int depth = 0;
-        boolean inString = false;
-
-        for (int i = 0; i < json.length(); i++) {
-            char c = json.charAt(i);
-
-            if (inString) {
-                if (c == '\\') {
-                    i++;
-                } else if (c == '"') {
-                    inString = false;
-                }
-                continue;
-            }
-
-            switch (c) {
-                case '"' -> {
-                    if (depth == 1 && json.startsWith(needle, i)) {
-                        int colon = json.indexOf(':', i + needle.length());
-                        if (colon > 0) {
-                            int valueAt = colon + 1;
-                            while (valueAt < json.length()
-                                    && Character.isWhitespace(json.charAt(valueAt))) {
-                                valueAt++;
-                            }
-                            return valueAt;
-                        }
-                    }
-                    inString = true;
-                }
-                case '{', '[' -> depth++;
-                case '}', ']' -> depth--;
-                default -> {
-                    // прочие символы значения нас не интересуют
-                }
-            }
+    public static String object(Object... keysAndValues) {
+        if (keysAndValues.length % 2 != 0) {
+            throw new IllegalArgumentException("нечётное число аргументов");
         }
-        return -1;
+        Map<String, Object> map = new LinkedHashMap<>();
+        for (int i = 0; i < keysAndValues.length; i += 2) {
+            map.put((String) keysAndValues[i], keysAndValues[i + 1]);
+        }
+        return write(map);
     }
 
-    private static String unescape(char escaped, String json, int at) {
-        return switch (escaped) {
-            case 'n' -> "\n";
-            case 't' -> "\t";
-            case 'r' -> "\r";
-            case 'b' -> "\b";
-            case 'f' -> "\f";
-            case 'u' -> at + 4 < json.length()
-                    ? String.valueOf((char) Integer.parseInt(json.substring(at + 1, at + 5), 16))
-                    : "";
-            default -> String.valueOf(escaped);
-        };
+    /** Записать дерево из {@link Map}, {@link List}, строк, чисел, булевых и {@code null}. */
+    public static String write(Object value) {
+        StringBuilder out = new StringBuilder();
+        write(value, out);
+        return out.toString();
+    }
+
+    private static void write(Object value, StringBuilder out) {
+        switch (value) {
+            case null -> out.append("null");
+            case String s -> out.append('"').append(escape(s)).append('"');
+            case Boolean b -> out.append(b);
+            case Number n -> out.append(n);
+            case Map<?, ?> map -> {
+                out.append('{');
+                boolean first = true;
+                for (Map.Entry<?, ?> e : map.entrySet()) {
+                    if (!first) {
+                        out.append(',');
+                    }
+                    first = false;
+                    out.append('"').append(escape(String.valueOf(e.getKey()))).append("\":");
+                    write(e.getValue(), out);
+                }
+                out.append('}');
+            }
+            case List<?> list -> {
+                out.append('[');
+                for (int i = 0; i < list.size(); i++) {
+                    if (i > 0) {
+                        out.append(',');
+                    }
+                    write(list.get(i), out);
+                }
+                out.append(']');
+            }
+            default -> throw new IllegalArgumentException("не умею записать " + value.getClass());
+        }
     }
 
     /** Экранирование строки для отправки. */
@@ -217,5 +307,105 @@ public final class Json {
             }
         }
         return result.toString();
+    }
+
+    // ---------- чтение дерева ----------
+
+    /**
+     * Узел дерева с безопасной навигацией: {@code body.get("tests").get("total").asLong(0)}.
+     *
+     * <p>Нет поля, не тот тип, не объект — получается {@link #MISSING},
+     * и цепочка не падает на середине. Это не «тихий ноль»: вызывающий
+     * явно пишет запасное значение и решает, что оно значит.
+     */
+    public record Node(Object value) {
+
+        /** Отсутствующее значение — не то же, что JSON {@code null}. */
+        public static final Node MISSING = new Node(Missing.INSTANCE);
+
+        private enum Missing { INSTANCE }
+
+        public boolean isMissing() {
+            return value == Missing.INSTANCE;
+        }
+
+        public boolean isObject() {
+            return value instanceof Map;
+        }
+
+        public boolean isArray() {
+            return value instanceof List;
+        }
+
+        /** Поле объекта; не объект или нет поля — {@link #MISSING}. */
+        public Node get(String key) {
+            if (value instanceof Map<?, ?> map && map.containsKey(key)) {
+                return new Node(map.get(key));
+            }
+            return MISSING;
+        }
+
+        /** Строка или {@code null}, если это не строка. */
+        public String string() {
+            return value instanceof String s ? s : null;
+        }
+
+        /** Строка; нет строки или она пустая — {@code null}. */
+        public String text() {
+            String s = string();
+            return s == null || s.isBlank() ? null : s;
+        }
+
+        public long asLong(long fallback) {
+            return value instanceof BigDecimal n ? Math.round(n.doubleValue()) : fallback;
+        }
+
+        public double asDouble(double fallback) {
+            return value instanceof BigDecimal n ? n.doubleValue() : fallback;
+        }
+
+        public boolean isNumber() {
+            return value instanceof BigDecimal;
+        }
+
+        public boolean asBool(boolean fallback) {
+            return value instanceof Boolean b ? b : fallback;
+        }
+
+        /** Ключи объекта в порядке ответа; не объект — пусто. */
+        public List<String> keys() {
+            if (value instanceof Map<?, ?> map) {
+                List<String> keys = new ArrayList<>(map.size());
+                map.keySet().forEach(k -> keys.add(String.valueOf(k)));
+                return keys;
+            }
+            return Collections.emptyList();
+        }
+
+        /** Элементы массива; не массив — пусто. */
+        public List<Node> items() {
+            if (value instanceof List<?> list) {
+                List<Node> items = new ArrayList<>(list.size());
+                list.forEach(item -> items.add(new Node(item)));
+                return items;
+            }
+            return Collections.emptyList();
+        }
+
+        /** Строковые элементы массива; остальное пропускается. */
+        public List<String> strings() {
+            List<String> result = new ArrayList<>();
+            for (Node item : items()) {
+                if (item.string() != null) {
+                    result.add(item.string());
+                }
+            }
+            return result;
+        }
+
+        /** Компактная запись — для сообщений об ошибке, когда объяснения нет. */
+        public String compact() {
+            return isMissing() ? "" : write(value);
+        }
     }
 }

@@ -1,7 +1,6 @@
 package io.hammerhall.cli;
 
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -12,154 +11,110 @@ import java.nio.charset.StandardCharsets;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Вывод: цвет и значки.
+ * Вывод: цвет — только терминалу, непроходимые символы — заменой.
  *
- * <h3>Почему это стоило тестов именно 03.08</h3>
- *
- * Оба свойства класса оказались сломаны молча, и оба — из-за того, что
- * условие однажды перестало означать то, что означало при написании.
- *
- * <ul>
- *   <li><b>Цвет.</b> Признаком терминала служило {@code System.console() != null}.
- *       С JDK 22 метод возвращает объект и при перенаправлении, поэтому цвет
- *       включался всегда — и в консоли Windows наружу лезло {@code ←[31m};</li>
- *   <li><b>Значки.</b> {@code ✓ ⚠ ✗} назначались раз и навсегда, а в cp866
- *       их нет: человек читал «? Ключ получен».</li>
- * </ul>
- *
- * 🔑 Ни то, ни другое не давало ошибки — только испорченный вывод. Ровно
- * тот класс, который ловится единственным способом: проверить, что видно
- * на выходе, а не что задумано в коде.
+ * <p>Пара «cp866 / UTF-8» — настоящая: русская консоль Windows и всё
+ * остальное. С 0.2.0 к ней — cp1251 (старые консоли), где нет блока
+ * полоски {@code █}: профиль превращался в вопросы (ревью CLI №1, СР-2).
  */
-@DisplayName("Console — цвет и значки")
+@DisplayName("Console — кодировка приёмника и цвет")
 class ConsoleTest {
 
-    private final ByteArrayOutputStream captured = new ByteArrayOutputStream();
-
-    /** Поток с заданной кодировкой: она и решает судьбу значков. */
-    private PrintStream stream(Charset charset) {
-        return new PrintStream(captured, true, charset);
-    }
-
-    private String printed(Charset charset) {
-        return captured.toString(charset);
-    }
-
-    @Nested
-    @DisplayName("цвет")
-    class Colour {
-
-        @Test
-        @DisplayName("терминал — escape-коды на месте")
-        void paintsForTerminal() {
-            PrintStream stream = stream(StandardCharsets.UTF_8);
-
-            new Console(stream, stream, true).success("Ключ получен");
-
-            assertThat(printed(StandardCharsets.UTF_8)).contains("\u001B[32m");
+    private record Captured(Console console, ByteArrayOutputStream bytesOut, ByteArrayOutputStream bytesErr,
+                            Charset charset) {
+        String out() {
+            return bytesOut.toString(charset);
         }
 
-        @Test
-        @DisplayName("🔴 не терминал — ни одного escape-кода")
-        void staysPlainOtherwise() {
-            // Положительный контроль к предыдущему: без него класс, никогда
-            // не красящий, прошёл бы одну проверку и провалил бы обе задачи.
-            PrintStream stream = stream(StandardCharsets.UTF_8);
-
-            Console console = new Console(stream, stream, false);
-            console.success("Ключ получен");
-            console.warn("Файл не игнорируется");
-            console.error("Ключ не принят");
-            console.dim("подробность");
-
-            assertThat(printed(StandardCharsets.UTF_8))
-                    .doesNotContain("\u001B[")
-                    .contains("Ключ получен");
+        String err() {
+            return bytesErr.toString(charset);
         }
     }
 
-    @Nested
-    @DisplayName("значки")
-    class Marks {
+    private static Captured console(Charset charset, boolean terminal, boolean colored) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ByteArrayOutputStream err = new ByteArrayOutputStream();
+        Console console = new Console(new PrintStream(out, true, charset), new PrintStream(err, true, charset),
+                terminal, colored);
+        return new Captured(console, out, err, charset);
+    }
 
-        @Test
-        @DisplayName("UTF-8 — значки как задуманы")
-        void usesGlyphsWhenEncodable() {
-            PrintStream stream = stream(StandardCharsets.UTF_8);
+    @Test
+    @DisplayName("UTF-8: типографика и значки — как есть")
+    void utf8KeepsEverything() {
+        Captured c = console(StandardCharsets.UTF_8, false, false);
+        c.console().success("Готово — «всё» → ок");
+        assertThat(c.out()).isEqualTo("✓ Готово — «всё» → ок" + System.lineSeparator());
+    }
 
-            new Console(stream, stream, false).success("Ключ получен");
+    @Test
+    @DisplayName("cp866: кириллица остаётся, тире и кавычки — ASCII, значок — [ok]")
+    void cp866Substitutes() {
+        Captured c = console(Charset.forName("IBM866"), false, false);
+        c.console().success("Hammerhall — клиент «кузницы»");
+        assertThat(c.out()).isEqualTo("[ok] Hammerhall - клиент \"кузницы\"" + System.lineSeparator());
+    }
 
-            assertThat(printed(StandardCharsets.UTF_8)).contains("✓ Ключ получен");
-        }
+    @Test
+    @DisplayName("🔴 СР-2: cp1251 — полоска профиля █ становится #, а не вопросами")
+    void cp1251Bar() {
+        Captured c = console(Charset.forName("windows-1251"), false, false);
+        c.console().print("  SEQ   ████····  4.5");
+        assertThat(c.out()).startsWith("  SEQ   ####····  4.5");
+        assertThat(c.out()).doesNotContain("?");
+        assertThat(Console.PROBE).contains("█");
+    }
 
-        @Test
-        @DisplayName("🔴 cp866 — ASCII вместо вопросительных знаков")
-        void fallsBackWhenNotEncodable() {
-            // Кодировка консоли русской Windows. Кириллица в ней есть,
-            // а ✓ ⚠ ✗ нет — без запасного набора они станут '?'.
-            Charset cp866 = Charset.forName("IBM866");
-            PrintStream stream = stream(cp866);
+    @Test
+    @DisplayName("🔴 СР-13: эмодзи из лога — один знак замены, а не два вопроса за суррогатные половинки")
+    void emojiByCodePoint() {
+        Captured c = console(Charset.forName("IBM866"), false, false);
+        c.console().print("вывод: 🔥 ▓▒░");
+        // ▓▒░ в cp866 есть (псевдографика) — остаются; эмодзи нет — один «?».
+        assertThat(c.out()).isEqualTo("вывод: ? ▓▒░" + System.lineSeparator());
+        Captured win = console(Charset.forName("windows-1251"), false, false);
+        win.console().print("▓▒░");
+        assertThat(win.out()).isEqualTo("#+." + System.lineSeparator());
+    }
 
-            Console console = new Console(stream, stream, false);
-            console.success("Ключ получен");
-            console.warn("Файл не игнорируется");
-            console.error("Ключ не принят");
+    @Test
+    @DisplayName("цвет — только когда велено; без цвета escape-кодов нет")
+    void colors() {
+        Captured plain = console(StandardCharsets.UTF_8, true, false);
+        plain.console().warn("осторожно");
+        plain.console().error("плохо");
+        plain.console().dim("тихо");
+        assertThat(plain.out() + plain.err()).doesNotContain("\u001B[");
 
-            String output = printed(cp866);
-            assertThat(output)
-                    .contains("[ok] Ключ получен")
-                    .contains("[!] Файл не игнорируется")
-                    .contains("[x] Ключ не принят")
-                    // Главное утверждение: в выводе нет потерянных символов.
-                    .doesNotContain("?");
-        }
+        Captured colored = console(StandardCharsets.UTF_8, true, true);
+        colored.console().warn("осторожно");
+        colored.console().error("плохо");
+        assertThat(colored.out()).contains("\u001B[33m");
+        assertThat(colored.err()).contains("\u001B[31m");
+        assertThat(colored.console().isTerminal()).isTrue();
+    }
 
-        @Test
-        @DisplayName("🔴 типографика тоже переживает cp866: тире, ёлочки, многоточие")
-        void downgradesTypography() {
-            // Первая правка меняла только ✓ ⚠ ✗ — и провалилась ровно там,
-            // где кончился список известного: длинное тире и кавычки-ёлочки
-            // остались в строках и стали '?'. Человек читал
-            // «Hammerhall ? клиент кузницы» и «?Забыли пароль??».
-            Charset cp866 = Charset.forName("IBM866");
-            PrintStream stream = stream(cp866);
+    @Test
+    @DisplayName("приглашение — на той же строке; справка при ошибке — в stderr; предупреждение один раз")
+    void promptBlockWarnOnce() {
+        Captured c = console(StandardCharsets.UTF_8, false, false);
+        c.console().prompt("Почта: ");
+        c.console().blockErr("справка\n");
+        c.console().block("ещё\n");
+        c.console().warnOnce("k", "один раз");
+        c.console().warnOnce("k", "один раз");
+        c.console().trace("→ GET");
+        assertThat(c.out()).startsWith("Почта: ещё").containsOnlyOnce("один раз");
+        assertThat(c.err()).contains("справка").contains("→ GET");
+    }
 
-            new Console(stream, stream, false)
-                    .print("Hammerhall — клиент; «Забыли пароль?» на сайте… SEQ 3→4");
-
-            assertThat(printed(cp866))
-                    .contains("Hammerhall - клиент")
-                    .contains("\"Забыли пароль?\"")
-                    .contains("сайте...")
-                    .contains("SEQ 3->4")
-                    .doesNotContain("?\u0020клиент");
-        }
-
-        @Test
-        @DisplayName("🔑 в UTF-8 типографика НЕ трогается")
-        void keepsTypographyInUtf8() {
-            // Положительный контроль: замена обязана включаться только там,
-            // где без неё потеря. Сработай она всегда — мы бы молча огрубили
-            // вывод у всех, у кого и так всё было хорошо.
-            PrintStream stream = stream(StandardCharsets.UTF_8);
-
-            new Console(stream, stream, false).print("Hammerhall — клиент «кузницы»");
-
-            assertThat(printed(StandardCharsets.UTF_8))
-                    .contains("Hammerhall — клиент «кузницы»");
-        }
-
-        @Test
-        @DisplayName("кириллица в cp866 доезжает целой — значки её не портят")
-        void keepsCyrillicInCp866() {
-            // Положительный контроль к предыдущему: он проверяет отсутствие '?',
-            // а это истинно и для пустого вывода.
-            Charset cp866 = Charset.forName("IBM866");
-            PrintStream stream = stream(cp866);
-
-            new Console(stream, stream, false).print("Решено задач: 10");
-
-            assertThat(printed(cp866)).isEqualTo("Решено задач: 10" + System.lineSeparator());
-        }
+    @Test
+    @DisplayName("adapt без кодировщика и на null — как есть")
+    void adaptPassThrough() {
+        Captured c = console(StandardCharsets.UTF_8, false, false);
+        assertThat(c.console().adapt(null)).isNull();
+        assertThat(c.console().adapt("✓")).isEqualTo("✓");
+        c.console().stackTrace(new IllegalStateException("трасса"));
+        assertThat(c.err()).contains("IllegalStateException");
     }
 }

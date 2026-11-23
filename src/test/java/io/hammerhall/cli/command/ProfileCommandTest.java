@@ -1,133 +1,134 @@
 package io.hammerhall.cli.command;
 
-import io.hammerhall.cli.Console;
+import io.hammerhall.cli.FakePlatform;
+import io.hammerhall.cli.World;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
-import java.io.ByteArrayOutputStream;
-import java.io.PrintStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Locale;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static io.hammerhall.cli.FakePlatform.json;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Профиль: разбор ответа платформы и отрисовка.
- *
- * <h3>Что охраняется</h3>
- *
- * Клиент здесь ничего не считает — все числа приходят с сервера, — но
- * разбирает JSON вручную, включая вырезание вложенных объектов и чтение
- * дробных чисел. Это тот код, который при смене формы ответа не падает,
- * а МОЛЧА рисует нули: человек решит, что потерял прогресс.
- *
- * <p>Отдельно охраняется порядок осей. Сервер присылает их от сильных к
- * слабым, и пересортировка на клиенте была бы спором с тем, кто знает больше.
- */
-@DisplayName("ProfileCommand — отрисовка профиля")
+@DisplayName("profile — профиль по осям и список кузниц")
 class ProfileCommandTest {
 
-    private final ByteArrayOutputStream out = new ByteArrayOutputStream();
-    private final ByteArrayOutputStream err = new ByteArrayOutputStream();
+    @TempDir
+    Path temp;
 
-    private final ProfileCommand command = new ProfileCommand(new Console(
-            new PrintStream(out, true, UTF_8), new PrintStream(err, true, UTF_8)));
+    private FakePlatform platform;
+    private World world;
 
-    /** Вывод без ANSI-раскраски — цвет зависит от наличия консоли, текст нет. */
-    private String printed() {
-        return (out.toString(UTF_8) + err.toString(UTF_8))
-                .replaceAll("\u001B\\[[0-9;]*m", "");
+    @BeforeEach
+    void setUp() throws IOException {
+        platform = new FakePlatform();
+        world = new World(temp).loggedIn(platform, "k");
     }
 
-    /**
-     * ⚠️ Фикстура списана с РЕАЛЬНОГО ответа платформы
-     * ({@code ProfileController.ProfileResponse}), а не придумана из кода
-     * клиента.
-     * <p>
-     * В первой версии этого теста поля назывались {@code tasksSolved} и
-     * {@code totalPoints} — так их читал клиент. Тест был зелёный, а платформа
-     * всё это время отдавала {@code solvedTasks} и {@code points}. Профиль
-     * показывал нули при трёх зачтённых задачах, и ни одна проверка этого не
-     * поймала: тест сверял клиент сам с собой.
-     * <p>
-     * Правило отсюда: фикстуру для чужого контракта берут у владельца
-     * контракта. Придуманная фикстура проверяет фантазию автора.
-     */
-    private static final String PROFILE = """
-            {"forgeId":"stream-forge","forgeName":"Stream Forge",
-             "solvedTasks":12,"points":47,
-             "axes":{
-               "SEQ":{"score":4.2,"ceiling":5,"creditedCeiling":4.6,"workload":3.1,"foundation":0.6},
-               "JOIN":{"score":1.5,"ceiling":2,"creditedCeiling":1.8,"workload":1.2,"foundation":0.25}
-             }}""";
-
-    @Test
-    @DisplayName("шапка: кузница, решено задач, очки")
-    void showsHeader() {
-        command.print("stream-forge", PROFILE);
-
-        assertThat(printed())
-                .contains("stream-forge")
-                .contains("Решено задач: 12")
-                .contains("47");
+    @AfterEach
+    void tearDown() {
+        platform.close();
     }
 
     @Test
-    @DisplayName("оси показаны с потолком и фундаментом")
-    void showsAxes() {
-        command.print("stream-forge", PROFILE);
-
-        // Числа не сверяем дословно: формат дробных зависит от локали
-        // (в русской «4,2», в английской «4.2»). Сверяем то, что от локали
-        // не зависит — что ось и её потолок вообще доехали до человека.
-        assertThat(printed())
-                .contains("SEQ")
-                .contains("потолок 5")
-                .contains("JOIN")
-                .contains("потолок 2");
+    @DisplayName("🔴 ВЫС-1: оси в ответе с пробелами — рисуются, а не «профиль пуст»; порядок — как прислал сервер")
+    void prettyAxes() {
+        platform.on("GET", "/profile/stream-forge", json(200, """
+                {
+                  "forgeName" : "Stream Forge",
+                  "solvedTasks" : 3,
+                  "points" : 40,
+                  "axes" : {
+                    "SEQ" : { "score" : 6.25, "ceiling" : 3, "foundation" : 0.7 },
+                    "JOIN" : { "score" : 0, "ceiling" : 0, "foundation" : 0.004 }
+                  }
+                }"""));
+        assertThat(world.run("profile")).isZero();
+        assertThat(world.out())
+                .contains("Stream Forge (stream-forge)")
+                .contains("Решено задач: 3   Очков: 40")
+                .containsSubsequence("SEQ", "JOIN")
+                .contains("██████████··········   6.3   потолок 3, фундамент 70%")
+                .contains("фундамент <1%")
+                .doesNotContain("Профиль пуст");
     }
 
     @Test
-    @DisplayName("🔴 порядок осей — как прислал сервер, без пересортировки")
-    void keepsServerOrder() {
-        command.print("stream-forge", PROFILE);
-        String text = printed();
-
-        assertThat(text.indexOf("SEQ"))
-                .as("SEQ пришла первой и должна остаться первой")
-                .isLessThan(text.indexOf("JOIN"));
+    @DisplayName("🔴 СР-1: потолок полоски — с сервера (fill, maxScore, axisMax); 12.5 — только запасное")
+    void ceilingFromServer() {
+        platform.on("GET", "/profile/spring-context", json(200, """
+                {"axisMax":5,"axes":{
+                   "A":{"score":2.5},
+                   "B":{"score":2.5,"maxScore":10},
+                   "C":{"score":1,"fill":1.0}}}"""));
+        assertThat(world.run("profile", "spring-context")).isZero();
+        String out = world.out();
+        assertThat(out).contains("A     " + "█".repeat(10) + "·".repeat(10));
+        assertThat(out).contains("B     " + "█".repeat(5) + "·".repeat(15));
+        assertThat(out).contains("C     " + "█".repeat(20));
+        assertThat(ProfileCommand.bar(-1)).isEqualTo("·".repeat(20));
+        assertThat(ProfileCommand.bar(7)).isEqualTo("█".repeat(20));
     }
 
     @Test
-    @DisplayName("пустой профиль — приглашение, а не нули по осям")
-    void emptyProfileIsInvitation() {
-        // Человек только зарегистрировался. Нули по восьми осям выглядели бы
-        // как поражение на старте.
-        command.print("stream-forge", """
-                {"forgeId":"stream-forge","solvedTasks":0,"points":0,"axes":{}}""");
-
-        assertThat(printed()).contains("Профиль пуст");
+    @DisplayName("🔴 СР-3: русская локаль машины — всё равно «4.5», а не «4,5»")
+    void rootLocale() {
+        Locale before = Locale.getDefault();
+        Locale.setDefault(Locale.forLanguageTag("ru-RU"));
+        try {
+            platform.on("GET", "/profile/stream-forge",
+                    json(200, "{\"axes\":{\"SEQ\":{\"score\":4.5,\"ceiling\":3,\"foundation\":0.5}}}"));
+            assertThat(world.run("profile")).isZero();
+            assertThat(world.out()).contains(" 4.5 ").doesNotContain("4,5");
+        } finally {
+            Locale.setDefault(before);
+        }
     }
 
     @Test
-    @DisplayName("🔴 задачи засчитаны, но осей нет — НЕ «решите первую задачу»")
-    void solvedWithoutAxesIsExplained() {
-        // Слой code не несёт разметки осей по устройству корпуса. Сказать
-        // «решите первую задачу» человеку, решившему три, значит соврать
-        // и отправить его искать несуществующую поломку.
-        command.print("stream-forge", """
-                {"forgeId":"stream-forge","solvedTasks":3,"points":0,"axes":{}}""");
-
-        assertThat(printed())
-                .contains("Решено задач: 3")
-                .contains("не несут осей");
+    @DisplayName("пустой вектор: решено ноль — «решите первую»; решено, но осей нет — не враньё")
+    void emptyVectors() {
+        platform.on("GET", "/profile/stream-forge",
+                json(200, "{\"solvedTasks\":0,\"axes\":{}}"),
+                json(200, "{\"solvedTasks\":3,\"axes\":{}}"));
+        world.run("profile");
+        assertThat(world.out()).contains("решите первую задачу");
+        world.clear();
+        world.run("profile");
+        assertThat(world.out()).contains("не несут осей").doesNotContain("решите первую");
     }
 
     @Test
-    @DisplayName("🔴 ответ без осей вообще — не падаем")
-    void survivesMissingAxes() {
-        command.print("stream-forge", """
-                {"forgeId":"stream-forge","solvedTasks":0,"points":0}""");
+    @DisplayName("🔴 ВЫС-2: вне кузницы — список кузниц (ответ-массив); профиль --help — справка, а не GET /profile/--help")
+    void forgesOutside() throws IOException {
+        platform.on("GET", "/profile", json(200, """
+                [{"id":"stream-forge","displayName":"Stream Forge","solvedTasks":3,"submissions":9},
+                 {"id":"spring-context","displayName":null,"solvedTasks":0,"submissions":0}]"""));
+        world.workDir = Files.createDirectories(world.home.resolve("elsewhere"));
+        assertThat(world.run("profile")).isZero();
+        assertThat(world.out()).contains("stream-forge").contains("Stream Forge").contains("решено   3, отправок 9")
+                .contains("spring-context").contains("hammerhall profile <кузница>");
 
-        assertThat(printed()).contains("Профиль пуст");
+        assertThat(world.run("profile", "--help")).isZero();
+        assertThat(platform.seen()).noneMatch(s -> s.path().contains("--help"));
+
+        platform.on("GET", "/profile", json(200, "[]"));
+        world.clear();
+        world.run("profile");
+        assertThat(world.out()).contains("Кузниц пока нет");
+    }
+
+    @Test
+    @DisplayName("ВЫС-9: негодный идентификатор кузницы — отказ до запроса")
+    void badForgeArgument() {
+        assertThat(world.run("profile", "a/b")).isEqualTo(2);
+        assertThat(world.err()).contains("не похоже на идентификатор кузницы");
+        assertThat(world.run("profile", "a", "b")).isEqualTo(2);
     }
 }
